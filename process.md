@@ -3,7 +3,7 @@
 > 目标：从零手写一个**可运行、可理解、标准版**的 RPC 框架（含注册中心）。
 > 定位：学习型项目，重点搞懂 RPC 的**核心链路**与**分层思想**，而非对标 Dubbo 的完整生产能力。
 >
-> 技术基线：Java 21 · Maven · 单模块（按包分层，后期可拆多模块）
+> 技术基线：Java 21 · Maven 多模块 · 框架与示例应用分离
 
 ---
 
@@ -50,67 +50,35 @@
 
 ---
 
-## 三、包结构规划（单模块按包分层）
+## 三、Maven 多模块结构
 
 ```
 mini-RPC
-├── pom.xml
-└── src/main/java/com/itheima/
-    ├── common/                  # 公共：协议常量、工具类
-    │   ├── RpcRequest.java      # 请求模型（实现 Serializable）
-    │   ├── RpcResponse.java     # 响应模型（含 code/message/data）
-    │   ├── RpcProtocol.java     # 协议常量：魔数、版本、消息类型、序列化类型枚举
-    │   └── RpcException.java    # 框架统一异常
-    │
-    ├── serialize/               # 序列化层（接口 + 多实现）
-    │   ├── Serializer.java      # 接口：serialize / deserialize / 获取类型枚举
-    │   ├── JdkSerializer.java
-    │   └── JsonSerializer.java  # 基于 Jackson
-    │
-    ├── transport/               # 传输层（通信）
-    │   ├── client/
-    │   │   ├── RpcClient.java   # 接口：sendRequest(RpcRequest) -> RpcResponse
-    │   │   ├── SocketRpcClient.java   # M1
-    │   │   └── NettyRpcClient.java    # M2
-    │   ├── server/
-    │   │   ├── RpcServer.java   # 接口：start() / stop()
-    │   │   ├── SocketRpcServer.java   # M1
-    │   │   └── NettyRpcServer.java    # M2
-    │   └── codec/               # M2：Netty 编解码器 + 协议帧
-    │       ├── RpcEncoder.java
-    │       └── RpcDecoder.java
-    │
-    ├── proxy/                   # 代理层
-    │   └── RpcClientProxy.java  # JDK 动态代理，屏蔽通信细节
-    │
-    ├── provider/                # 服务提供方本地注册表
-    │   ├── ServiceProvider.java # 接口：注册/获取/移除本地服务
-    │   └── DefaultServiceProvider.java  # Map<String,Object> 缓存
-    │
-    ├── registry/                # 注册中心层
-    │   ├── ServiceRegistry.java    # 接口：register / unregister（服务端用）
-    │   ├── ServiceDiscovery.java   # 接口：discover（客户端用）
-    │   └── ZookeeperRegistry.java  # 基于 Curator 实现二者
-    │
-    ├── loadbalance/             # 负载均衡
-    │   ├── LoadBalance.java     # 接口：select(List<String> addresses)
-    │   ├── RandomLoadBalance.java
-    │   └── RoundRobinLoadBalance.java
-    │
-    ├── annotation/              # 注解（M4 引入）
-    │   ├── RpcService.java      # 标记服务实现类
-    │   └── RpcReference.java    # 标记客户端注入点
-    │
-    ├── config/
-    │   └── RpcConfig.java       # 集中配置：序列化类型、注册中心地址、端口等
-    │
-    └── example/                 # 示例（含 api 契约 + provider + consumer）
-        ├── api/  HelloService.java
-        ├── provider/  ProviderMain.java, HelloServiceImpl.java
-        └── consumer/  ConsumerMain.java
+├── pom.xml                              # 父工程：聚合模块、统一版本
+├── mini-rpc-core/                       # 通用 RPC 框架
+│   └── src/main/java/com/itheima/
+│       ├── common/                      # 请求、响应、协议常量、统一异常
+│       ├── serialize/                   # 序列化接口与实现
+│       ├── proxy/                       # 客户端动态代理
+│       ├── provider/                    # 服务注册表与反射调用
+│       └── transport/                   # Socket/Netty 客户端与服务端
+│
+├── mini-rpc-example-api/                # 客户端、服务端共享的服务契约
+│   └── src/main/java/com/itheima/example/api/
+│       └── HelloService.java
+│
+├── mini-rpc-example-provider/           # 服务提供者应用
+│   └── src/main/java/com/itheima/example/provider/
+│       ├── HelloServiceImpl.java
+│       └── ProviderMain.java
+│
+└── mini-rpc-example-consumer/           # 服务消费者应用
+    └── src/main/java/com/itheima/example/consumer/
+        └── ConsumerMain.java
 ```
 
-> 说明：`example` 里的 api 契约被 provider 和 consumer **共同依赖**，是接口优先思想的落地。
+> 模块依赖：`provider -> core + api`，`consumer -> core + api`。
+> consumer **不依赖 provider**，因此客户端只能看到公共接口，无法访问服务端实现类。
 
 ---
 
@@ -247,4 +215,4 @@ mini-RPC
 2. **请求ID 匹配是 Netty 化的难点**：异步模型下务必用 `CompletableFuture` 挂起，避免同步阻塞或响应错配。
 3. **序列化注意跨版本兼容**：JDK 序列化要求两边类版本一致，JSON 更适合调试观察报文。
 4. **ZooKeeper 需本地环境**：提前装好或用 Docker（`zookeeper:3.8`）起一个单节点，避免卡在环境上。
-5. **先单模块后拆分**：当前按包分层足够清晰，等功能稳定再考虑拆 `rpc-core` / `example-api` 等 Maven 多模块。
+5. **模块边界保持清晰**：业务接口与 DTO 放在 `example-api`；服务实现只放在 provider；consumer 不得依赖 provider；通用框架不得依赖任何示例业务模块。
