@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.itheima</groupId>
+    <artifactId>mini-RPC</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <!-- 明确要求编译器先执行 Lombok 注解处理，再编译生成后的 Java 代码。 -->
+        <maven.compiler.proc>full</maven.compiler.proc>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 集中管理依赖版本，升级时只需要修改这一处。 -->
+        <lombok.version>1.18.48</lombok.version>
+        <jackson.version>2.22.3</jackson.version>
+        <slf4j.version>2.0.20</slf4j.version>
+        <logback.version>1.6.5</logback.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            Lombok 在编译阶段生成 getter、setter、构造方法等重复代码。
+            provided 表示编译时需要它，但程序运行时不需要把 Lombok 一起打包。
+        -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            Jackson 可以在 Java 对象和 JSON 之间转换。
+            M0 只准备依赖，JsonSerializer 会在后续阶段实现。
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!--
+            SLF4J 只定义统一的日志 API，框架代码以后面向它记录日志，
+            不直接依赖某一种具体日志实现。
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!--
+            Logback 是 SLF4J 的具体实现，负责把日志真正输出到控制台或文件。
+            runtime 表示编译业务代码时只需要 SLF4J，运行程序时才需要 Logback。
+        -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+</project>
