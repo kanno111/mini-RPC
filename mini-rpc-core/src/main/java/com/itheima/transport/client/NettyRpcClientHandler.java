@@ -18,9 +18,7 @@ import org.slf4j.LoggerFactory;
  * <pre>
  * 网络字节
  *    ↓
- * LengthFieldBasedFrameDecoder：取得一条完整响应正文
- *    ↓
- * RpcDecoder：正文变成 RpcResponse
+ * RpcDecoder：取得完整协议帧，并把正文还原成 RpcResponse
  *    ↓
  * NettyRpcClientHandler：按 requestId 完成对应 Future
  * </pre>

@@ -20,9 +20,7 @@ import org.slf4j.LoggerFactory;
  * <pre>
  * 网络字节
  *    ↓
- * LengthFieldBasedFrameDecoder：切出完整消息
- *    ↓
- * RpcDecoder：字节变成 RpcRequest
+ * RpcDecoder：切出完整协议帧，并把正文还原成 RpcRequest
  *    ↓
  * NettyRpcServerHandler：执行请求，得到 RpcResponse
  *    ↓
@@ -71,7 +69,7 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
         /*
          * 第二步：把响应写回当前客户端。
          * writeAndFlush 并不是直接把 Java 对象塞进网络：响应会沿着 Pipeline 的
-         * 出站方向经过 RpcEncoder，编码成 [正文长度 + 正文] 后才真正发送。
+         * 出站方向经过 RpcEncoder，编码成 [20 字节协议头 + 正文] 后才真正发送。
          *
          * write：把消息写入 Netty 的发送缓冲区。
          * flush：立刻要求 Netty 尝试把缓冲区里的消息发送出去。

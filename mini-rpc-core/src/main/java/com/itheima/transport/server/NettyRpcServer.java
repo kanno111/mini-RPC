@@ -1,7 +1,6 @@
 package com.itheima.transport.server;
 
 import com.itheima.common.RpcException;
-import com.itheima.common.RpcRequest;
 import com.itheima.provider.RpcRequestHandler;
 import com.itheima.serialize.Serializer;
 import com.itheima.transport.codec.RpcDecoder;
@@ -15,7 +14,6 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,15 +31,12 @@ import org.slf4j.LoggerFactory;
  *      ↓
  * 每条连接自己的 Pipeline
  *      ↓
- * 帧解码器 → RpcDecoder → RpcEncoder → NettyRpcServerHandler
+ * RpcDecoder → RpcEncoder → NettyRpcServerHandler
  * </pre>
  */
 public class NettyRpcServer implements RpcServer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NettyRpcServer.class);
-
-    /** M2 单条正文最大为 10 MB；完整帧还要加上前面的 4 字节长度。 */
-    private static final int MAX_FRAME_LENGTH = 10 * 1024 * 1024 + Integer.BYTES;
 
     /** 服务端要监听的端口。 */
     private final int port;
@@ -196,20 +191,9 @@ public class NettyRpcServer implements RpcServer {
      */
     private void configurePipeline(SocketChannel channel) {
         channel.pipeline()
-                /*
-                 * 根据开头 4 字节的正文长度等待完整消息。
-                 * 最后的 Integer.BYTES 表示向后传递时去掉这 4 字节长度字段。
-                 */
-                .addLast(new LengthFieldBasedFrameDecoder(
-                        MAX_FRAME_LENGTH,
-                        0,
-                        Integer.BYTES,
-                        0,
-                        Integer.BYTES
-                ))
-                // 入站：把一条完整正文反序列化成 RpcRequest。
-                .addLast(new RpcDecoder<>(serializer, RpcRequest.class))
-                // 出站：把 RpcResponse 编码成“长度 + 正文”。
+                // 入站：等待完整的 M3 协议帧，并把正文反序列化成 RpcRequest。
+                .addLast(new RpcDecoder())
+                // 出站：把 RpcResponse 编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
                 // 入站：执行请求并写回响应。
                 .addLast(serverHandler);

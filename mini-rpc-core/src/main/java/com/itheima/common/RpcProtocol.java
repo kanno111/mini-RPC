@@ -58,6 +58,16 @@ public final class RpcProtocol {
     public static final byte SERIALIZER_JSON = 2;
 
     /**
+     * 表示 RPC 响应执行成功。
+     *
+     * <p>请求报文中的状态字段暂时没有业务含义，也固定写入这个值。</p>
+     */
+    public static final byte STATUS_SUCCESS = 0;
+
+    /** 表示 RPC 响应执行失败。 */
+    public static final byte STATUS_FAILURE = 1;
+
+    /**
      * 工具类不需要创建对象，因此使用私有构造方法阻止外部执行 new RpcProtocol()。
      */
     private RpcProtocol() {

@@ -1,6 +1,9 @@
 package com.itheima.transport.codec;
 
 import com.itheima.common.RpcException;
+import com.itheima.common.RpcProtocol;
+import com.itheima.common.RpcRequest;
+import com.itheima.common.RpcResponse;
 import com.itheima.serialize.Serializer;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -11,24 +14,22 @@ import io.netty.handler.codec.MessageToByteEncoder;
  *
  * <p>这个类是 Netty 出站（outbound）处理器。当后续代码执行
  * {@code channel.writeAndFlush(rpcRequest)} 时，消息会沿着 Pipeline 的出站方向
- * 经过这里，再被转换成下面的字节格式：</p>
+ * 经过这里，再被转换成 M3 自定义协议帧：</p>
  *
  * <pre>
- * ┌──────────────────┬──────────────────────────┐
- * │ 正文长度（4字节） │ Serializer 生成的正文    │
- * └──────────────────┴──────────────────────────┘
+ * ┌────────┬──────┬────────┬────────┬──────┬───────────┬──────────┬──────────┐
+ * │ 魔数4B │版本1B│序列化1B│消息类型1B│状态1B│ requestId 8B│正文长度4B│正文 N 字节│
+ * └────────┴──────┴────────┴────────┴──────┴───────────┴──────────┴──────────┘
  * </pre>
  *
- * <p>TCP 只是一条连续的字节流，不会告诉接收方“一条消息在哪里结束”。
- * 因此必须先写入正文长度，接收方才知道后面应该读取多少个字节。</p>
- *
- * <p>M2 暂时沿用 M1 的“长度 + 正文”格式，方便只关注 Netty 的工作方式。
- * M3 才会加入魔数、协议版本、消息类型、序列化类型等完整协议头。</p>
+ * <p>协议头固定占 {@link RpcProtocol#HEADER_LENGTH} 字节。它让接收方在读取正文前，
+ * 就能校验报文来源和协议版本，并知道正文使用的序列化方式、消息类型、请求编号
+ * 以及正文长度。</p>
  */
 public class RpcEncoder extends MessageToByteEncoder<Object> {
 
     /**
-     * M2 单条消息允许的最大正文长度：10 MB。
+     * M3 单条消息允许的最大正文长度：10 MB。
      *
      * <p>限制长度可以避免错误对象被序列化成过大的消息，占用过多内存。</p>
      */
@@ -65,19 +66,62 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
             Object message,
             ByteBuf output
     ) {
-        // 第一步：复用已有 Serializer，把 Java 对象转换成正文 byte[]。
+        if (message == null) {
+            throw new RpcException("待编码的 RPC 消息不能为空");
+        }
+
+        byte messageType;
+        byte status;
+        long requestId;
+
+        /*
+         * 第一步：根据 Java 对象类型生成协议头中的消息元数据。
+         * 当前只允许发送 RpcRequest 和 RpcResponse，其他对象没有对应的协议类型。
+         */
+        if (message instanceof RpcRequest request) {
+            messageType = RpcProtocol.MESSAGE_TYPE_REQUEST;
+            // 请求还没有执行结果，因此状态字段暂时固定写 0，接收方会忽略它。
+            status = RpcProtocol.STATUS_SUCCESS;
+            requestId = request.getRequestId();
+        } else if (message instanceof RpcResponse response) {
+            messageType = RpcProtocol.MESSAGE_TYPE_RESPONSE;
+            status = response.getCode() == RpcResponse.SUCCESS_CODE
+                    ? RpcProtocol.STATUS_SUCCESS
+                    : RpcProtocol.STATUS_FAILURE;
+            requestId = response.getRequestId();
+        } else {
+            throw new RpcException(
+                    "不支持编码的 RPC 消息类型：" + message.getClass().getName()
+            );
+        }
+
+        validateRequestId(requestId);
+
+        // 第二步：复用已有 Serializer，把 Java 对象转换成正文 byte[]。
         byte[] body = serializer.serialize(message);
         validateBodyLength(body.length);
 
         /*
-         * 第二步：先写入一个 int，固定占 4 字节，用来表示正文长度。
-         * ByteBuf.writeInt 与 M1 的 DataOutputStream.writeInt 都使用大端字节序，
-         * 因此当前 Netty 编码结果与 M1 的临时消息格式保持一致。
+         * 第三步：严格按照 RpcProtocol 约定的顺序写入 20 字节协议头。
+         * 接收方必须使用完全相同的顺序和字节数读取，否则字段会错位。
          */
-        output.writeInt(body.length);
+        output.writeInt(RpcProtocol.MAGIC_NUMBER);     // 0~3：魔数，4 字节
+        output.writeByte(RpcProtocol.VERSION);         // 4：协议版本，1 字节
+        output.writeByte(serializer.getType());        // 5：序列化类型，1 字节
+        output.writeByte(messageType);                 // 6：请求或响应，1 字节
+        output.writeByte(status);                      // 7：响应状态，1 字节
+        output.writeLong(requestId);                   // 8~15：请求编号，8 字节
+        output.writeInt(body.length);                  // 16~19：正文长度，4 字节
 
-        // 第三步：紧接着写入完整正文，最终得到“4 字节长度 + N 字节正文”。
+        // 第四步：协议头后面紧跟序列化产生的完整正文。
         output.writeBytes(body);
+    }
+
+    /** 检查请求编号，避免发送无法进行请求—响应匹配的报文。 */
+    private void validateRequestId(long requestId) {
+        if (requestId <= 0) {
+            throw new RpcException("RPC requestId 必须大于 0：" + requestId);
+        }
     }
 
     /**

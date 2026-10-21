@@ -2,19 +2,19 @@ package com.itheima.example.consumer;
 
 import com.itheima.example.api.HelloService;
 import com.itheima.proxy.RpcClientProxy;
-import com.itheima.serialize.JdkSerializer;
+import com.itheima.serialize.JsonSerializer;
 import com.itheima.serialize.Serializer;
 import com.itheima.transport.client.NettyRpcClient;
 
 /**
- * M2 阶段的 RPC 客户端启动入口。
+ * M3 阶段的 RPC 客户端启动入口。
  *
  * <p>客户端只依赖 {@link HelloService} 接口，并不知道服务端使用的是
  * {@code HelloServiceImpl}。接口方法真正在哪里执行，由 RPC 框架屏蔽。</p>
  */
 public class ConsumerMain {
 
-    /** 127.0.0.1 表示当前电脑；M2 暂时仍把服务地址直接写在代码中。 */
+    /** 127.0.0.1 表示当前电脑；M3 暂时仍把服务地址直接写在代码中。 */
     private static final String SERVER_HOST = "127.0.0.1";
 
     /** 必须与 ProviderMain 中服务端监听的端口保持一致。 */
@@ -27,10 +27,13 @@ public class ConsumerMain {
      */
     public static void main(String[] args) {
         /*
-         * 第一步：创建与服务端相同的序列化器。
-         * 服务端使用 JDK 方式解码，因此客户端也必须使用 JDK 方式编码。
+         * 第一步：选择客户端发送请求时使用的序列化器。
+         *
+         * JsonSerializer 会把 RpcRequest 转换成 JSON 正文；RpcEncoder 还会把
+         * JSON 的类型编号 2 写进协议头。服务端的 RpcDecoder 读取编号后，
+         * 会自动选择 JsonSerializer，不需要在 Pipeline 中提前指定。
          */
-        Serializer serializer = new JdkSerializer();
+        Serializer serializer = new JsonSerializer();
 
         /*
          * 第二步：创建真正负责网络通信的 Netty 客户端。
@@ -60,7 +63,7 @@ public class ConsumerMain {
              */
             String result = helloService.sayHello("world");
 
-            // 如果控制台打印出服务端生成的问候语，说明 M2 Netty 全链路已经跑通。
+            // 如果控制台打印出服务端生成的问候语，说明 M3 JSON 全链路已经跑通。
             System.out.println("RPC 调用结果：" + result);
         }
     }

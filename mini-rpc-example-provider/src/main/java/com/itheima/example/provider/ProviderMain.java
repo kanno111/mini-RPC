@@ -4,13 +4,13 @@ import com.itheima.example.api.HelloService;
 import com.itheima.provider.DefaultServiceProvider;
 import com.itheima.provider.RpcRequestHandler;
 import com.itheima.provider.ServiceProvider;
-import com.itheima.serialize.JdkSerializer;
+import com.itheima.serialize.JsonSerializer;
 import com.itheima.serialize.Serializer;
 import com.itheima.transport.server.NettyRpcServer;
 import com.itheima.transport.server.RpcServer;
 
 /**
- * M2 阶段的 RPC 服务端启动入口。
+ * M3 阶段的 RPC 服务端启动入口。
  *
  * <p>这个类本身不处理网络请求，也不执行业务逻辑。它的作用是把已经写好的
  * 服务注册表、请求处理器、序列化器和 Netty 服务端组装起来，然后启动服务。</p>
@@ -46,7 +46,11 @@ public class ProviderMain {
          * serializer 负责：在 Java 对象与网络字节之间相互转换。
          */
         RpcRequestHandler requestHandler = new RpcRequestHandler(serviceProvider);
-        Serializer serializer = new JdkSerializer();
+        /*
+         * M3 在这里切换为 JSON：服务端返回响应时，RpcEncoder 会使用它生成正文，
+         * 并在协议头的 serializerType 字段写入数字 2。
+         */
+        Serializer serializer = new JsonSerializer();
 
         /*
          * 第四步：把端口、序列化器和请求处理器交给 Netty 服务端。

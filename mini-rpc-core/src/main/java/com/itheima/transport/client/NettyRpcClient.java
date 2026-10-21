@@ -15,7 +15,6 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,9 +40,6 @@ import java.util.concurrent.TimeoutException;
 public class NettyRpcClient implements RpcClient, AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NettyRpcClient.class);
-
-    /** M2 单条响应正文最大为 10 MB；完整帧还包含 4 字节长度。 */
-    private static final int MAX_FRAME_LENGTH = 10 * 1024 * 1024 + Integer.BYTES;
 
     /** 连接服务端最多等待 5 秒。 */
     private static final int CONNECT_TIMEOUT_MILLIS = 5_000;
@@ -152,22 +148,14 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /**
      * 为客户端连接安装处理器。
      *
-     * <p>客户端和服务端使用相同的临时消息格式，但解码目标不同：服务端解码
-     * RpcRequest，客户端解码 {@link RpcResponse}。</p>
+     * <p>客户端和服务端使用同一套 M3 自定义协议。解码器会读取协议头中的消息类型，
+     * 自动判断正文应该还原成 RpcRequest 还是 {@link RpcResponse}。</p>
      */
     private void configurePipeline(SocketChannel socketChannel) {
         socketChannel.pipeline()
-                // 入站：根据 4 字节长度字段取得一条完整响应正文。
-                .addLast(new LengthFieldBasedFrameDecoder(
-                        MAX_FRAME_LENGTH,
-                        0,
-                        Integer.BYTES,
-                        0,
-                        Integer.BYTES
-                ))
-                // 入站：把完整正文反序列化成 RpcResponse。
-                .addLast(new RpcDecoder<>(serializer, RpcResponse.class))
-                // 出站：以后发送 RpcRequest 时，把它编码成“长度 + 正文”。
+                // 入站：等待完整的 M3 协议帧，并把正文反序列化成 RpcResponse。
+                .addLast(new RpcDecoder())
+                // 出站：发送 RpcRequest 时，把它编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
                 // 入站：根据响应 requestId 完成对应 Future。
                 .addLast(clientHandler);
