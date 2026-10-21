@@ -32,6 +32,8 @@
         <jackson.version>2.22.3</jackson.version>
         <slf4j.version>2.0.20</slf4j.version>
         <logback.version>1.6.5</logback.version>
+        <!-- Netty 是 M2 使用的网络通信框架，由父工程统一管理版本。 -->
+        <netty.version>4.2.19.Final</netty.version>
     </properties>
 
     <!--
@@ -72,6 +74,11 @@
                 <groupId>ch.qos.logback</groupId>
                 <artifactId>logback-classic</artifactId>
                 <version>${logback.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-all</artifactId>
+                <version>${netty.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

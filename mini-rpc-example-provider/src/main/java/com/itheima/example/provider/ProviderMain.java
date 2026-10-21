@@ -6,14 +6,14 @@ import com.itheima.provider.RpcRequestHandler;
 import com.itheima.provider.ServiceProvider;
 import com.itheima.serialize.JdkSerializer;
 import com.itheima.serialize.Serializer;
+import com.itheima.transport.server.NettyRpcServer;
 import com.itheima.transport.server.RpcServer;
-import com.itheima.transport.server.SocketRpcServer;
 
 /**
- * M1 阶段的 RPC 服务端启动入口。
+ * M2 阶段的 RPC 服务端启动入口。
  *
  * <p>这个类本身不处理网络请求，也不执行业务逻辑。它的作用是把已经写好的
- * 服务注册表、请求处理器、序列化器和 Socket 服务端组装起来，然后启动服务。</p>
+ * 服务注册表、请求处理器、序列化器和 Netty 服务端组装起来，然后启动服务。</p>
  */
 public class ProviderMain {
 
@@ -49,10 +49,10 @@ public class ProviderMain {
         Serializer serializer = new JdkSerializer();
 
         /*
-         * 第四步：把端口、序列化器和请求处理器交给 Socket 服务端。
-         * 到这里，SocketRpcServer 才具备完整处理 RPC 请求的条件。
+         * 第四步：把端口、序列化器和请求处理器交给 Netty 服务端。
+         * 到这里，NettyRpcServer 才具备完整处理 RPC 请求的条件。
          */
-        RpcServer rpcServer = new SocketRpcServer(
+        RpcServer rpcServer = new NettyRpcServer(
                 RPC_PORT,
                 serializer,
                 requestHandler
@@ -60,7 +60,7 @@ public class ProviderMain {
 
         /*
          * 在 IDE 中点击停止或操作系统结束 JVM 时，尽量关闭监听端口和线程池。
-         * SocketRpcServer.stop() 允许重复调用，因此和 start() 内部的清理不冲突。
+         * NettyRpcServer.stop() 允许重复调用，因此和 start() 内部的清理不冲突。
          */
         Runtime.getRuntime().addShutdownHook(
                 new Thread(rpcServer::stop, "rpc-server-shutdown")

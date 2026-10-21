@@ -34,5 +34,14 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
+
+        <!--
+            M2 使用 Netty 实现新的客户端和服务端传输层。
+            这里只声明“core 模块需要 Netty”，具体版本由父工程统一管理。
+        -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+        </dependency>
     </dependencies>
 </project>
