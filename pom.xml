@@ -34,6 +34,8 @@
         <logback.version>1.6.5</logback.version>
         <!-- Netty 是 M2 使用的网络通信框架，由父工程统一管理版本。 -->
         <netty.version>4.2.19.Final</netty.version>
+        <!-- Curator 是 M4 操作 ZooKeeper 的 Java 客户端框架。 -->
+        <curator.version>5.9.0</curator.version>
     </properties>
 
     <!--
@@ -79,6 +81,11 @@
                 <groupId>io.netty</groupId>
                 <artifactId>netty-all</artifactId>
                 <version>${netty.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.curator</groupId>
+                <artifactId>curator-framework</artifactId>
+                <version>${curator.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

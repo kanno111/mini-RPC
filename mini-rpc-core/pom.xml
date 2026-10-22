@@ -43,5 +43,14 @@
             <groupId>io.netty</groupId>
             <artifactId>netty-all</artifactId>
         </dependency>
+
+        <!--
+            M4 使用 Curator 连接和操作外部 ZooKeeper 服务。
+            当前先引入基础 Framework；需要节点缓存、监听等高级能力时再加入 recipes。
+        -->
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+        </dependency>
     </dependencies>
 </project>
