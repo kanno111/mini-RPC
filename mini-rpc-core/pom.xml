@@ -52,5 +52,14 @@
             <groupId>org.apache.curator</groupId>
             <artifactId>curator-framework</artifactId>
         </dependency>
+
+        <!--
+            Java 反射可以读取一个已知类的注解，但不能直接列出包中的所有类。
+            ClassGraph 负责扫描指定包，找出所有带有 @RpcService 的实现类。
+        -->
+        <dependency>
+            <groupId>io.github.classgraph</groupId>
+            <artifactId>classgraph</artifactId>
+        </dependency>
     </dependencies>
 </project>

@@ -58,10 +58,27 @@ public class ConsumerMain {
              * -> 客户端按 requestId 匹配 RpcResponse
              * -> 把响应数据作为 sayHello 的返回值。
              */
-            String result = helloService.sayHello("world");
-
-            // 能打印服务端生成的问候语，就说明 M4 注册中心调用链已经跑通。
-            System.out.println("RPC 调用结果：" + result);
+            /*
+             * 连续调用四次，用来观察轮询负载均衡。
+             *
+             * 如果 ZooKeeper 中同时存在 8080 和 8081 两个 Provider，预期结果是：
+             * 第 1 次 -> 8080
+             * 第 2 次 -> 8081
+             * 第 3 次 -> 8080
+             * 第 4 次 -> 8081
+             *
+             * HelloServiceImpl 会在响应文字中写出自己的进程 ID。两个 Provider
+             * 是两个不同的 Java 进程，因此可以根据进程 ID 判断本次请求由
+             * 哪个 Provider 处理。
+             */
+            for (int callNumber = 1; callNumber <= 4; callNumber++) {
+                String result = helloService.sayHello(
+                        "world-" + callNumber
+                );
+                System.out.println(
+                        "第 " + callNumber + " 次 RPC 调用结果：" + result
+                );
+            }
         }
     }
 }
