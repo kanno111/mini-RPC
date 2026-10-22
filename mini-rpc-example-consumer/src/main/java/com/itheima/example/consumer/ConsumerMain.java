@@ -1,24 +1,19 @@
 package com.itheima.example.consumer;
 
+import com.itheima.client.RpcClientFactory;
 import com.itheima.example.api.HelloService;
-import com.itheima.proxy.RpcClientProxy;
-import com.itheima.serialize.JsonSerializer;
-import com.itheima.serialize.Serializer;
-import com.itheima.transport.client.NettyRpcClient;
 
 /**
- * M3 阶段的 RPC 客户端启动入口。
+ * M4 阶段使用注册中心的 RPC 客户端启动入口。
  *
  * <p>客户端只依赖 {@link HelloService} 接口，并不知道服务端使用的是
  * {@code HelloServiceImpl}。接口方法真正在哪里执行，由 RPC 框架屏蔽。</p>
+ *
+ * <p>与 M3 的固定地址版本相比，这里不再写死 Provider 的 IP 和端口，
+ * 也不再由业务代码手动组装序列化器、Netty 客户端、服务发现和负载均衡器。
+ * 这些内部组件统一由 {@link RpcClientFactory} 管理。</p>
  */
 public class ConsumerMain {
-
-    /** 127.0.0.1 表示当前电脑；M3 暂时仍把服务地址直接写在代码中。 */
-    private static final String SERVER_HOST = "127.0.0.1";
-
-    /** 必须与 ProviderMain 中服务端监听的端口保持一致。 */
-    private static final int SERVER_PORT = 8080;
 
     /**
      * 启动客户端并完成一次远程调用。
@@ -27,43 +22,45 @@ public class ConsumerMain {
      */
     public static void main(String[] args) {
         /*
-         * 第一步：选择客户端发送请求时使用的序列化器。
+         * 第一步：创建 RPC 客户端工厂。
          *
-         * JsonSerializer 会把 RpcRequest 转换成 JSON 正文；RpcEncoder 还会把
-         * JSON 的类型编号 2 写进协议头。服务端的 RpcDecoder 读取编号后，
-         * 会自动选择 JsonSerializer，不需要在 Pipeline 中提前指定。
+         * 无参构造方法默认连接本机 ZooKeeper：127.0.0.1:2181。
+         * 工厂内部已经准备好：
+         * 1. ZooKeeper 服务发现；
+         * 2. 轮询负载均衡；
+         * 3. JSON 序列化；
+         * 4. Netty 网络客户端；
+         * 5. JDK 动态代理。
+         *
+         * try-with-resources 会在代码块结束时自动关闭 Netty 和 ZooKeeper 资源。
          */
-        Serializer serializer = new JsonSerializer();
-
-        /*
-         * 第二步：创建真正负责网络通信的 Netty 客户端。
-         * 构造方法只准备线程组和 Bootstrap，第一次发送请求时才建立 Channel。
-         * try-with-resources 会在调用结束后自动执行 rpcClient.close()。
-         */
-        try (NettyRpcClient rpcClient = new NettyRpcClient(
-                SERVER_HOST,
-                SERVER_PORT,
-                serializer
-        )) {
+        try (RpcClientFactory factory = new RpcClientFactory()) {
 
             /*
-             * 第三步：创建代理工厂，再让它生成一个实现了 HelloService 的代理对象。
+             * 第二步：只告诉框架“我需要 HelloService”。
+             *
+             * 框架会创建一个实现了 HelloService 的 JDK 动态代理对象。
              * helloService 不是 HelloServiceImpl，也不包含真正的问候业务逻辑。
+             * 此时只是创建代理，还没有向 Provider 发送请求。
              */
-            RpcClientProxy proxyFactory = new RpcClientProxy(rpcClient);
-            HelloService helloService = proxyFactory.createProxy(HelloService.class);
+            HelloService helloService = factory.createProxy(HelloService.class);
 
             /*
-             * 第四步：像调用本地 Java 方法一样调用代理对象。
+             * 第三步：像调用本地 Java 方法一样调用代理对象。
              *
              * 实际过程是：
-             * 代理拦截方法 -> 生成 RpcRequest -> Netty 发送 -> 服务端执行
-             * -> 异步收到 RpcResponse -> 根据 requestId 完成 Future
-             * -> 取出 data 并作为 sayHello 的返回值。
+             * 代理拦截方法
+             * -> 生成 RpcRequest
+             * -> 根据接口全限定名查询 ZooKeeper
+             * -> 轮询选择一个 Provider
+             * -> 建立或复用 Netty Channel
+             * -> 服务端执行真正的方法
+             * -> 客户端按 requestId 匹配 RpcResponse
+             * -> 把响应数据作为 sayHello 的返回值。
              */
             String result = helloService.sayHello("world");
 
-            // 如果控制台打印出服务端生成的问候语，说明 M3 JSON 全链路已经跑通。
+            // 能打印服务端生成的问候语，就说明 M4 注册中心调用链已经跑通。
             System.out.println("RPC 调用结果：" + result);
         }
     }

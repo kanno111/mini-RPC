@@ -1,8 +1,10 @@
 package com.itheima.transport.client;
 
+import com.itheima.cluster.ServiceAddressResolver;
 import com.itheima.common.RpcException;
 import com.itheima.common.RpcRequest;
 import com.itheima.common.RpcResponse;
+import com.itheima.registry.ServiceAddress;
 import com.itheima.serialize.Serializer;
 import com.itheima.transport.codec.RpcDecoder;
 import com.itheima.transport.codec.RpcEncoder;
@@ -15,10 +17,15 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -33,7 +40,8 @@ import java.util.concurrent.TimeoutException;
  * NettyRpcClient
  *      ├── EventLoopGroup：执行客户端网络事件
  *      ├── Bootstrap：保存客户端连接配置
- *      ├── Channel：代表与服务端建立的一条连接
+ *      ├── ServiceAddressResolver：为每次请求选择 Provider 地址
+ *      ├── Channel 缓存：每个 Provider 地址复用一条连接
  *      └── Pipeline：负责编码请求、解码响应和匹配 Future
  * </pre>
  */
@@ -47,20 +55,37 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /** 一次 RPC 请求最多等待服务端响应 5 秒。 */
     private static final long REQUEST_TIMEOUT_SECONDS = 5;
 
-    /** RPC 服务端主机名或 IP 地址。 */
-    private final String host;
+    /**
+     * Channel 上用于保存 PendingRequestManager 的属性键。
+     *
+     * <p>Netty 允许给每条 Channel 附加自己的属性。以后客户端同时连接多个
+     * Provider 时，每条连接都会通过这个 key 取得属于自己的等待请求表。</p>
+     */
+    private static final AttributeKey<PendingRequestManager>
+            PENDING_REQUEST_MANAGER_KEY =
+            AttributeKey.valueOf("miniRpcPendingRequestManager");
 
-    /** RPC 服务端端口。 */
-    private final int port;
+    /** 根据请求中的接口名称，找到本次调用应使用的 Provider 地址。 */
+    private final ServiceAddressResolver addressResolver;
 
     /** 请求和响应正文共用的序列化器。 */
     private final Serializer serializer;
 
-    /** 保存“requestId → 等待响应的 Future”的对应关系。 */
-    private final PendingRequestManager pendingRequestManager;
+    /**
+     * 已经建立的连接缓存：key 是 Provider 地址，value 是对应的 Netty Channel。
+     *
+     * <p>{@link ConcurrentHashMap} 允许多个业务线程并发读取已经建立的连接。</p>
+     */
+    private final Map<ServiceAddress, Channel> channels =
+            new ConcurrentHashMap<>();
 
-    /** 客户端收到 RpcResponse 后使用的最后一个入站 Handler。 */
-    private final NettyRpcClientHandler clientHandler;
+    /**
+     * 创建连接和关闭客户端时共用的锁。
+     *
+     * <p>它可以防止两个线程同时为同一个地址建立重复连接，也可以防止客户端
+     * 正在关闭时，另一个线程又把一条新连接放进缓存。</p>
+     */
+    private final Object connectionLock = new Object();
 
     /** 客户端的网络事件线程组；当前只维护一条连接，一个线程已经足够。 */
     private final EventLoopGroup eventLoopGroup;
@@ -68,42 +93,45 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /** Netty 客户端启动器，可以理解为创建连接时使用的配置模板。 */
     private final Bootstrap bootstrap;
 
-    /**
-     * 当前与服务端建立的连接。
-     *
-     * <p>声明为 volatile，保证业务线程能够看到 Netty 线程更新后的 Channel 状态。</p>
-     */
-    private volatile Channel channel;
-
     /** 客户端是否已经被永久关闭。关闭后不允许重新连接。 */
     private volatile boolean closed;
 
     /**
      * 创建 Netty RPC 客户端，但此时还不会立即连接服务端。
      *
-     * <p>采用延迟连接的原因是：创建客户端对象只完成配置，真正需要发送请求时
-     * 再建立网络连接。如果用户希望提前连接，也可以主动调用 {@link #connect()}。</p>
+     * <p>这是为了兼容 M1～M3 的固定地址用法。内部会把固定地址包装成一个
+     * {@link ServiceAddressResolver}；无论请求什么服务，它都返回同一个地址。</p>
      *
      * @param host       服务端主机名或 IP，例如 127.0.0.1
      * @param port       服务端端口，范围是 1 到 65535
      * @param serializer 请求和响应使用的序列化器
      */
     public NettyRpcClient(String host, int port, Serializer serializer) {
-        if (host == null || host.isBlank()) {
-            throw new RpcException("RPC 服务端地址不能为空");
-        }
-        if (port < 1 || port > 65535) {
-            throw new RpcException("RPC 服务端端口必须在 1 到 65535 之间：" + port);
+        this(createFixedAddressResolver(host, port), serializer);
+    }
+
+    /**
+     * 创建能够动态发现 Provider 的 Netty RPC 客户端。
+     *
+     * <p>构造时不会连接任何 Provider。真正发送请求时，客户端才会根据请求中的
+     * 接口名解析地址，并按需建立或复用该地址的 Channel。</p>
+     *
+     * @param addressResolver 服务地址解析器，负责服务发现和负载均衡
+     * @param serializer      请求和响应使用的序列化器
+     */
+    public NettyRpcClient(
+            ServiceAddressResolver addressResolver,
+            Serializer serializer
+    ) {
+        if (addressResolver == null) {
+            throw new RpcException("ServiceAddressResolver 不能为空");
         }
         if (serializer == null) {
             throw new RpcException("Serializer 不能为空");
         }
 
-        this.host = host;
-        this.port = port;
+        this.addressResolver = addressResolver;
         this.serializer = serializer;
-        this.pendingRequestManager = new PendingRequestManager();
-        this.clientHandler = new NettyRpcClientHandler(pendingRequestManager);
 
         /*
          * Netty 4.2 把事件循环线程组和具体 I/O 实现分开配置。
@@ -114,6 +142,15 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
                 NioIoHandler.newFactory()
         );
         this.bootstrap = createBootstrap();
+    }
+
+    /** 把旧版的固定 host、port 包装成地址解析器。 */
+    private static ServiceAddressResolver createFixedAddressResolver(
+            String host,
+            int port
+    ) {
+        ServiceAddress fixedAddress = new ServiceAddress(host, port);
+        return ignoredServiceName -> fixedAddress;
     }
 
     /**
@@ -152,53 +189,97 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      * 自动判断正文应该还原成 RpcRequest 还是 {@link RpcResponse}。</p>
      */
     private void configurePipeline(SocketChannel socketChannel) {
+        /*
+         * 每建立一条 Channel，就创建一份独立的等待请求表。
+         *
+         * 假设以后客户端同时连接 8080 和 8081：
+         * - 8080 的 Channel 只保存发往 8080 的等待请求；
+         * - 8081 的 Channel 只保存发往 8081 的等待请求。
+         *
+         * 因此 8080 断开时，它的 Handler 只会 failAll() 自己这份表，
+         * 不会错误地让 8081 上仍在正常等待的请求失败。
+         */
+        PendingRequestManager channelPendingRequests =
+                new PendingRequestManager();
+
+        // 把请求表附加到当前 Channel，发送请求时可以从同一条 Channel 上取回。
+        socketChannel.attr(PENDING_REQUEST_MANAGER_KEY)
+                .set(channelPendingRequests);
+
         socketChannel.pipeline()
                 // 入站：等待完整的 M3 协议帧，并把正文反序列化成 RpcResponse。
                 .addLast(new RpcDecoder())
                 // 出站：发送 RpcRequest 时，把它编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
-                // 入站：根据响应 requestId 完成对应 Future。
-                .addLast(clientHandler);
+                // 入站：只在当前 Channel 的等待请求表中匹配 response。
+                .addLast(new NettyRpcClientHandler(channelPendingRequests));
     }
 
     /**
-     * 建立连接；如果已有可用连接，则直接复用，不会重复连接。
+     * 取得指定 Provider 的连接；如果已有可用连接，则直接复用。
      *
-     * <p>方法使用 synchronized，防止多个业务线程第一次同时发送请求时，
-     * 各自创建一条重复连接。</p>
+     * <p>只有第一次访问某个地址，或者旧连接已经失效时，才会建立新 Channel。</p>
      */
-    public synchronized void connect() {
-        if (closed) {
-            throw new RpcException("已经关闭的 Netty RPC 客户端不能重新连接");
+    private Channel getOrCreateChannel(ServiceAddress address) {
+        if (address == null) {
+            throw new RpcException("解析得到的 Provider 地址不能为空");
         }
 
-        // Channel 存在并且仍可用时，直接复用已有连接。
-        if (channel != null && channel.isActive()) {
-            return;
+        Channel cachedChannel = channels.get(address);
+        if (!closed && cachedChannel != null && cachedChannel.isActive()) {
+            return cachedChannel;
         }
 
-        try {
-            /*
-             * connect() 发起异步连接，sync() 让当前业务线程等待连接结果。
-             * 连接成功后保存 Channel，后续所有请求都通过它发送。
-             */
-            channel = bootstrap.connect(host, port).sync().channel();
-            LOGGER.info("Netty RPC 客户端已连接服务端：{}:{}", host, port);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new RpcException("连接 RPC 服务端时线程被中断", exception);
-        } catch (RuntimeException exception) {
-            throw new RpcException(
-                    "连接 RPC 服务端失败，地址：" + host + ":" + port,
-                    exception
-            );
+        synchronized (connectionLock) {
+            if (closed) {
+                throw new RpcException("已经关闭的 Netty RPC 客户端不能重新连接");
+            }
+
+            // 获取锁后再次检查，避免等待锁期间其他线程已经建立了连接。
+            cachedChannel = channels.get(address);
+            if (cachedChannel != null && cachedChannel.isActive()) {
+                return cachedChannel;
+            }
+
+            if (cachedChannel != null) {
+                channels.remove(address, cachedChannel);
+                cachedChannel.close();
+            }
+
+            try {
+                Channel newChannel = bootstrap
+                        .connect(address.host(), address.port())
+                        .sync()
+                        .channel();
+
+                channels.put(address, newChannel);
+
+                /*
+                 * Channel 将来如果被服务端关闭，就自动从缓存中删除。
+                 * remove(address, newChannel) 只在 Map 中仍是这条旧连接时才删除，
+                 * 不会误删该地址后来重新建立的新 Channel。
+                 */
+                newChannel.closeFuture().addListener(
+                        ignored -> channels.remove(address, newChannel)
+                );
+
+                LOGGER.info("Netty RPC 客户端已连接 Provider：{}", address.asText());
+                return newChannel;
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new RpcException("连接 RPC Provider 时线程被中断", exception);
+            } catch (RuntimeException exception) {
+                throw new RpcException(
+                        "连接 RPC Provider 失败，地址：" + address.asText(),
+                        exception
+                );
+            }
         }
     }
 
-    /** 判断当前客户端是否拥有一条仍可用的连接。 */
+    /** 判断当前客户端是否至少拥有一条仍可用的 Provider 连接。 */
     public boolean isConnected() {
-        Channel currentChannel = channel;
-        return !closed && currentChannel != null && currentChannel.isActive();
+        return !closed && channels.values().stream().anyMatch(Channel::isActive);
     }
 
     /**
@@ -218,32 +299,48 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
         }
 
         /*
-         * 第一步：保证存在可用连接。
-         * 第一次请求会建立 Channel；后续请求会复用已经存在的 Channel。
+         * 第一步：用接口名解析出本次调用的 Provider 地址。
+         * 动态解析器会在内部完成“服务发现 + 负载均衡”；固定地址解析器则始终
+         * 返回同一个地址。
          */
-        connect();
+        ServiceAddress targetAddress =
+                addressResolver.resolve(request.getInterfaceName());
+
+        /*
+         * 第二步：取得该地址对应的 Channel。
+         * 已连接过就复用；第一次使用或旧连接失效时才新建。
+         */
+        Channel currentChannel = getOrCreateChannel(targetAddress);
+        if (!currentChannel.isActive()) {
+            long requestId = request.getRequestId();
+            throw new RpcException(
+                    "发送 RPC 请求前连接已经失效，requestId：" + requestId
+                            + "，Provider：" + targetAddress.asText()
+            );
+        }
+
+        /*
+         * 第三步：从“本次真正使用的 Channel”上取得它自己的等待请求表。
+         * 这能确保请求只受当前 Provider 连接状态的影响。
+         */
+        PendingRequestManager pendingRequestManager =
+                currentChannel.attr(PENDING_REQUEST_MANAGER_KEY).get();
+        if (pendingRequestManager == null) {
+            throw new RpcException("当前 Channel 缺少等待请求管理器");
+        }
 
         long requestId = request.getRequestId();
 
         /*
-         * 第二步：必须先登记 Future，再发送请求。
+         * 必须先登记 Future，再发送请求。
          * 如果先发送，响应速度非常快时，客户端 Handler 可能已经收到响应，
          * 但 Map 中还没有 Future，导致响应无法匹配。
          */
         CompletableFuture<RpcResponse> responseFuture =
                 pendingRequestManager.register(requestId);
 
-        Channel currentChannel = channel;
-        if (currentChannel == null || !currentChannel.isActive()) {
-            RpcException exception = new RpcException(
-                    "发送 RPC 请求前连接已经失效，requestId：" + requestId
-            );
-            pendingRequestManager.completeExceptionally(requestId, exception);
-            throw exception;
-        }
-
         /*
-         * 第三步：异步发送请求。
+         * 第四步：异步发送请求。
          * writeAndFlush 会立即返回一个 Netty Future，不会等待服务端响应。
          * 如果连“写入网络”这一步都失败，就让对应 CompletableFuture 异常完成。
          */
@@ -260,7 +357,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
         });
 
         /*
-         * 第四步：业务线程限时等待响应。
+         * 第五步：业务线程限时等待响应。
          * Netty I/O 线程收到响应后，NettyRpcClientHandler 会调用
          * responseFuture.complete(response)，从而唤醒这里的业务线程。
          */
@@ -302,38 +399,35 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     }
 
     /**
-     * 关闭当前连接和客户端网络线程组。
+     * 关闭全部 Provider 连接和客户端网络线程组。
      *
      * <p>该方法实现 {@link AutoCloseable}，以后既可以主动调用，也可以放进
      * try-with-resources 中自动执行。重复关闭是安全的。</p>
      */
     @Override
     public void close() {
-        Channel channelToClose;
+        List<Channel> channelsToClose;
 
-        synchronized (this) {
+        synchronized (connectionLock) {
             if (closed) {
                 return;
             }
 
             closed = true;
-            channelToClose = channel;
-            channel = null;
+            channelsToClose = new ArrayList<>(channels.values());
+            channels.clear();
         }
 
-        if (channelToClose != null) {
+        for (Channel channelToClose : channelsToClose) {
             channelToClose.close().syncUninterruptibly();
         }
 
         /*
-         * Channel 关闭通常会触发 clientHandler.channelInactive()，从而结束等待请求。
-         * 这里再执行一次 failAll，用来覆盖“尚未建立 Channel 就关闭”等边界情况。
+         * Channel 关闭会触发属于该 Channel 的 Handler.channelInactive()，
+         * 由 Handler 结束这条连接上仍在等待的所有请求。
          */
-        pendingRequestManager.failAll(
-                new RpcException("Netty RPC 客户端已经关闭")
-        );
         eventLoopGroup.shutdownGracefully().syncUninterruptibly();
 
-        LOGGER.info("Netty RPC 客户端已关闭，服务端地址：{}:{}", host, port);
+        LOGGER.info("Netty RPC 客户端已关闭，共关闭 {} 条 Provider 连接", channelsToClose.size());
     }
 }
