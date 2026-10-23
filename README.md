@@ -46,11 +46,15 @@ JDK 动态代理
 | M4 | ZooKeeper 注册发现、轮询负载均衡 | 已完成基础版本 |
 | M4 | `@RpcService` 扫描并自动注册服务端实现 | 已完成 |
 | M4 | `@RpcReference` 字段代理注入 | 已完成基础版本 |
-| M4 | 服务发现本地缓存和 ZooKeeper 节点监听 | 尚未实现 |
+| M4 | 服务发现本地缓存和 ZooKeeper 节点监听 | 已完成基础版本 |
 | S1 | Spring Boot Starter、自动配置和配置绑定骨架 | 已完成 |
 | S2 | Spring 管理客户端工厂并自动注入 `@RpcReference` | 已完成基础版本 |
 | S3 | Spring Bean 形式的 `@RpcService` 自动发布 | 已完成基础版本 |
 | S4 | Provider、Consumer 改造成 Spring Boot 示例并端到端联调 | 已完成 |
+| S5-A | Consumer 全局 `request-timeout` 接入底层客户端 | 已完成 |
+| S5-B-A | 服务发现 3 秒本地地址缓存 | 已完成 |
+| S5-B-B | ZooKeeper Watch 主动失效地址缓存 | 已完成 |
+| S5-C | Netty 端口绑定成功后再发布 Provider 地址 | 已完成 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -163,8 +167,9 @@ mini-rpc:
   server-port: 8080
 ```
 
-`registry-address`、`provider-enabled`、`server-host` 和 `server-port` 已经接入
-实际装配。`request-timeout` 目前只完成绑定，尚未传入底层客户端。
+`registry-address`、`request-timeout`、`provider-enabled`、`server-host` 和
+`server-port` 都已经接入实际装配。`request-timeout` 控制请求发出后等待 Provider
+响应的最长时间，不等同于建立 TCP 连接时使用的连接超时。
 
 ### 3.4 mini-rpc-example-api
 
@@ -315,8 +320,10 @@ ZooKeeper 中保存的结构：
 服务目录是持久节点，Provider 地址是临时节点。Provider 会话失效后，对应的
 临时地址会由 ZooKeeper 自动删除。
 
-当前 `ZooKeeperServiceDiscovery` 每次调用都会查询一次 ZooKeeper，尚未实现
-本地缓存和节点变化监听。
+当前 `ZooKeeperServiceDiscovery` 会把查询结果在 Consumer 内存中缓存 3 秒，并在
+查询时注册一次性 ZooKeeper Watch。Provider 上下线后，Watch 会立即删除对应
+缓存；下一次调用重新查询并注册新的 Watch。3 秒有效期保留为网络或会话异常时
+的兜底。
 
 ### 4.6 loadbalance：负载均衡
 
@@ -527,11 +534,12 @@ RpcProvider.registerService(...)
 DefaultServiceProvider 写入当前 JVM 的本地映射
 HelloService 全限定名 → HelloServiceImpl 对象
                ↓
+后台线程运行 RpcProvider.start()
+NettyRpcServer 绑定并开始监听 8080
+               ↓ 绑定成功回调
+RpcProvider.publishServices()
 ZooKeeperServiceRegistry 创建临时地址节点
 HelloService 全限定名 → 127.0.0.1:8080
-               ↓
-后台线程运行 RpcProvider.start()
-NettyRpcServer 开始监听 8080
                ↓
 服务可以被远程调用
 ```
@@ -540,8 +548,11 @@ NettyRpcServer 开始监听 8080
 
 1. 服务实现对象已经创建；
 2. 本地服务表已经保存接口到对象的映射；
-3. ZooKeeper 已经保存接口到网络地址的映射；
-4. Netty 已经成功监听对应端口。
+3. Netty 已经成功监听对应端口；
+4. ZooKeeper 已经保存接口到网络地址的映射。
+
+第 3 步必须先于第 4 步。如果端口被其他程序占用，Netty 绑定失败，启动成功
+回调不会执行，ZooKeeper 中也就不会出现这个无法连接的 Provider 地址。
 
 `@RpcService` 自己不会完成以上动作，它只是一个“标记”。Starter、Spring 容器、
 `RpcProvider`、ZooKeeper 和 Netty 共同完成后面的工作。
@@ -753,8 +764,9 @@ mini-rpc-example-consumer
 5. `SpringRpcProviderLifecycle.registerService(...)`；
 6. `RpcProvider.registerService(...)`；
 7. `DefaultServiceProvider.registerService(...)`；
-8. `ZooKeeperServiceRegistry.register(...)`；
-9. `NettyRpcServer.start()`。
+8. `NettyRpcServer.start(...)`：观察 `bind(port).sync()` 完成；
+9. `RpcProvider.publishServices()`：由端口绑定成功回调触发；
+10. `ZooKeeperServiceRegistry.register(...)`。
 
 ### Consumer 注入代理
 
@@ -801,18 +813,19 @@ mini-rpc-example-consumer
 
 当前实现适合学习和本地演示，还存在以下限制：
 
-1. 服务发现每次请求都会访问 ZooKeeper，没有本地缓存和节点监听；
-2. `request-timeout` 已能绑定配置，但尚未传入 `NettyRpcClient`；
-3. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
-4. 协议预留了心跳消息类型，但尚未实现心跳检测；
-5. 暂无失败重试、熔断、限流和降级；
-6. 序列化方式和负载均衡策略尚不能通过 Starter 配置切换；
-7. Provider 当前先注册 ZooKeeper 地址，再启动 Netty，理论上存在极短的
-   “地址已可见但端口尚未监听”窗口；
-8. 自动化测试覆盖了 Spring 自动配置与服务扫描；真实 ZooKeeper + Netty 调用
+1. 服务发现已有本地缓存和一次性 ZooKeeper Watch，但当前是“变化后失效、下次
+   调用再查询”，尚未在后台主动构建最新地址快照；
+2. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
+3. 协议预留了心跳消息类型，但尚未实现心跳检测；
+4. 暂无失败重试、熔断、限流和降级；
+5. 序列化方式和负载均衡策略尚不能通过 Starter 配置切换；
+6. 当前只支持 Consumer 全局 `request-timeout`，尚不支持在每个
+   `@RpcReference` 上覆盖超时；
+7. 自动化测试覆盖了 Spring 自动配置、服务扫描和 Provider 发布顺序；真实
+   ZooKeeper + Netty 调用
    当前通过本地端到端联调验证，尚未做成可重复运行的容器集成测试；
-9. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
-10. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
+8. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
+9. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
 ---
 
@@ -820,11 +833,9 @@ mini-rpc-example-consumer
 
 Spring 基础链路已经完整跑通。接下来优先提高 Starter 的可配置性和运行可靠性：
 
-1. 把 `request-timeout` 真正传入客户端，并增加超时配置测试；
-2. 为服务发现增加本地缓存和 ZooKeeper 节点变化监听；
-3. 调整 Provider 启动顺序，Netty 监听成功后再向 ZooKeeper 暴露地址；
-4. 增加可重复运行的 Testcontainers 端到端集成测试；
-5. 再逐步加入重试、心跳、优雅停机、SPI 和更多策略配置。
+1. 增加可重复运行的 Testcontainers 端到端集成测试；
+2. 支持 `@RpcReference` 单引用超时覆盖全局超时；
+3. 再逐步加入重试、心跳、优雅停机、SPI 和更多策略配置。
 
 更细的 Spring 分步计划参见
 [DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。

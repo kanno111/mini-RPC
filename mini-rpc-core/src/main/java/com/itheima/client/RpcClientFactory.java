@@ -9,6 +9,8 @@ import com.itheima.registry.zookeeper.ZooKeeperServiceDiscovery;
 import com.itheima.serialize.JsonSerializer;
 import com.itheima.transport.client.NettyRpcClient;
 
+import java.time.Duration;
+
 /**
  * 面向 RPC 使用者的高层客户端工厂。
  *
@@ -58,7 +60,10 @@ public final class RpcClientFactory implements AutoCloseable {
      * 使用本地默认 ZooKeeper 地址 {@code 127.0.0.1:2181} 创建客户端工厂。
      */
     public RpcClientFactory() {
-        this(ZooKeeperClientFactory.DEFAULT_CONNECT_STRING);
+        this(
+                ZooKeeperClientFactory.DEFAULT_CONNECT_STRING,
+                NettyRpcClient.DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     /**
@@ -76,6 +81,25 @@ public final class RpcClientFactory implements AutoCloseable {
      * @param zooKeeperAddress ZooKeeper 地址，例如 {@code 127.0.0.1:2181}
      */
     public RpcClientFactory(String zooKeeperAddress) {
+        this(
+                zooKeeperAddress,
+                NettyRpcClient.DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /**
+     * 使用指定 ZooKeeper 地址和请求超时时间创建客户端工厂。
+     *
+     * <p>Spring Starter 会走这个构造方法，把 application.yml 中已经绑定成
+     * {@link Duration} 的 request-timeout 一直传到 NettyRpcClient。</p>
+     *
+     * @param zooKeeperAddress ZooKeeper 地址，例如 {@code 127.0.0.1:2181}
+     * @param requestTimeout   每次请求等待 Provider 响应的最长时间
+     */
+    public RpcClientFactory(
+            String zooKeeperAddress,
+            Duration requestTimeout
+    ) {
         this.serviceDiscovery =
                 new ZooKeeperServiceDiscovery(zooKeeperAddress);
 
@@ -88,7 +112,8 @@ public final class RpcClientFactory implements AutoCloseable {
 
             this.rpcClient = new NettyRpcClient(
                     addressResolver,
-                    new JsonSerializer()
+                    new JsonSerializer(),
+                    requestTimeout
             );
             this.proxyFactory = new RpcClientProxy(rpcClient);
         } catch (RuntimeException exception) {

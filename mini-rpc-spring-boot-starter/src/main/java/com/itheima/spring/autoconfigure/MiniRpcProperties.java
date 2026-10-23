@@ -22,8 +22,8 @@ import java.time.Duration;
  * <p>自动绑定到本类的各个字段。这里的“绑定”可以简单理解为：Spring 读取
  * 配置文件，然后调用对应的 setter 把值写入 Java 对象。</p>
  *
- * <p>目前注册中心地址、Provider 开关、主机和端口已经接入自动配置；
- * {@code requestTimeout} 已能被读取，但还没有传入底层客户端。</p>
+ * <p>目前注册中心地址、请求超时、Provider 开关、主机和端口都已经接入
+ * 自动配置。</p>
  */
 @ConfigurationProperties(prefix = "mini-rpc")
 public class MiniRpcProperties {

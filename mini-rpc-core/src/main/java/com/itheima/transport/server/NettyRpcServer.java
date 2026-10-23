@@ -99,7 +99,11 @@ public class NettyRpcServer implements RpcServer {
      * 因此 ProviderMain 的启动方式以后不需要改变。</p>
      */
     @Override
-    public void start() {
+    public void start(Runnable onStarted) {
+        if (onStarted == null) {
+            throw new RpcException("Netty RPC 服务端启动回调不能为空");
+        }
+
         try {
             synchronized (this) {
                 if (running) {
@@ -134,6 +138,15 @@ public class NettyRpcServer implements RpcServer {
             }
 
             LOGGER.info("Netty RPC 服务端已启动，监听端口：{}", port);
+
+            /*
+             * 此时 bind(...).sync() 已经成功返回，说明操作系统端口已经真正绑定。
+             * RpcProvider 会在这个回调中把服务地址发布到 ZooKeeper。
+             *
+             * 如果发布失败，回调会抛出异常；下面的 finally 仍会执行 stop()，
+             * 因此不会留下一个“端口开着但 Provider 启动失败”的残缺实例。
+             */
+            onStarted.run();
 
             /*
              * closeFuture() 只有在服务端 Channel 被关闭时才会完成。

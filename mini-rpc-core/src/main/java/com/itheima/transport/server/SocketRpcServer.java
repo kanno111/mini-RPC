@@ -98,7 +98,11 @@ public class SocketRpcServer implements RpcServer {
      * 发生异常。一个 SocketRpcServer 实例停止后不能再次启动。</p>
      */
     @Override
-    public void start() {
+    public void start(Runnable onStarted) {
+        if (onStarted == null) {
+            throw new RpcException("Socket RPC 服务端启动回调不能为空");
+        }
+
         synchronized (this) {
             if (running) {
                 throw new RpcException("Socket RPC 服务端已经启动");
@@ -118,6 +122,12 @@ public class SocketRpcServer implements RpcServer {
         LOGGER.info("Socket RPC 服务端已启动，监听端口：{}", port);
 
         try {
+            /*
+             * new ServerSocket(port) 已经成功，说明端口现在可以接受连接。
+             * 先通知上层“网络已准备好”，上层才可以把地址发布到注册中心。
+             */
+            onStarted.run();
+
             while (running) {
                 try {
                     Socket socket = serverSocket.accept();

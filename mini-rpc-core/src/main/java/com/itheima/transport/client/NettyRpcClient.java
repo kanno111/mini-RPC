@@ -21,6 +21,7 @@ import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -52,8 +53,14 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /** 连接服务端最多等待 5 秒。 */
     private static final int CONNECT_TIMEOUT_MILLIS = 5_000;
 
-    /** 一次 RPC 请求最多等待服务端响应 5 秒。 */
-    private static final long REQUEST_TIMEOUT_SECONDS = 5;
+    /**
+     * 没有显式配置时，一次 RPC 请求默认最多等待服务端响应 5 秒。
+     *
+     * <p>这个常量是默认值，不再直接写死在等待逻辑中。Spring Starter 可以把
+     * application.yml 中的 request-timeout 通过构造方法传进来。</p>
+     */
+    public static final Duration DEFAULT_REQUEST_TIMEOUT =
+            Duration.ofSeconds(5);
 
     /**
      * Channel 上用于保存 PendingRequestManager 的属性键。
@@ -70,6 +77,13 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
 
     /** 请求和响应正文共用的序列化器。 */
     private final Serializer serializer;
+
+    /**
+     * 业务线程等待一次 RPC 响应的最长毫秒数。
+     *
+     * <p>它只限制“请求发出后等待响应”的时间，不等同于上面的 TCP 连接超时。</p>
+     */
+    private final long requestTimeoutMillis;
 
     /**
      * 已经建立的连接缓存：key 是 Provider 地址，value 是对应的 Netty Channel。
@@ -107,7 +121,32 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      * @param serializer 请求和响应使用的序列化器
      */
     public NettyRpcClient(String host, int port, Serializer serializer) {
-        this(createFixedAddressResolver(host, port), serializer);
+        this(
+                createFixedAddressResolver(host, port),
+                serializer,
+                DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /**
+     * 使用固定服务端地址，并指定一次请求等待响应的最长时间。
+     *
+     * @param host           服务端主机名或 IP
+     * @param port           服务端端口
+     * @param serializer     请求和响应使用的序列化器
+     * @param requestTimeout 请求响应超时时间，最小为 1 毫秒
+     */
+    public NettyRpcClient(
+            String host,
+            int port,
+            Serializer serializer,
+            Duration requestTimeout
+    ) {
+        this(
+                createFixedAddressResolver(host, port),
+                serializer,
+                requestTimeout
+        );
     }
 
     /**
@@ -123,6 +162,21 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
             ServiceAddressResolver addressResolver,
             Serializer serializer
     ) {
+        this(addressResolver, serializer, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 创建能够动态发现 Provider、并使用指定请求超时的 Netty 客户端。
+     *
+     * @param addressResolver 服务地址解析器
+     * @param serializer      请求和响应使用的序列化器
+     * @param requestTimeout  请求发出后等待响应的最长时间，最小为 1 毫秒
+     */
+    public NettyRpcClient(
+            ServiceAddressResolver addressResolver,
+            Serializer serializer,
+            Duration requestTimeout
+    ) {
         if (addressResolver == null) {
             throw new RpcException("ServiceAddressResolver 不能为空");
         }
@@ -132,6 +186,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
 
         this.addressResolver = addressResolver;
         this.serializer = serializer;
+        this.requestTimeoutMillis = validateRequestTimeout(requestTimeout);
 
         /*
          * Netty 4.2 把事件循环线程组和具体 I/O 实现分开配置。
@@ -142,6 +197,34 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
                 NioIoHandler.newFactory()
         );
         this.bootstrap = createBootstrap();
+    }
+
+    /**
+     * 校验超时配置并转换成 CompletableFuture.get() 使用的毫秒数。
+     */
+    private static long validateRequestTimeout(Duration requestTimeout) {
+        if (requestTimeout == null) {
+            throw new RpcException("RPC 请求超时时间不能为空");
+        }
+
+        final long timeoutMillis;
+        try {
+            timeoutMillis = requestTimeout.toMillis();
+        } catch (ArithmeticException exception) {
+            throw new RpcException("RPC 请求超时时间过大", exception);
+        }
+
+        if (timeoutMillis <= 0) {
+            throw new RpcException("RPC 请求超时时间不能小于 1 毫秒");
+        }
+        return timeoutMillis;
+    }
+
+    /**
+     * 返回当前真正参与请求等待的超时时间，便于测试和运行诊断。
+     */
+    public Duration getRequestTimeout() {
+        return Duration.ofMillis(requestTimeoutMillis);
     }
 
     /** 把旧版的固定 host、port 包装成地址解析器。 */
@@ -363,13 +446,13 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
          */
         try {
             return responseFuture.get(
-                    REQUEST_TIMEOUT_SECONDS,
-                    TimeUnit.SECONDS
+                    requestTimeoutMillis,
+                    TimeUnit.MILLISECONDS
             );
         } catch (TimeoutException exception) {
             RpcException timeoutException = new RpcException(
                     "等待 RPC 响应超时，requestId：" + requestId
-                            + "，超时时间：" + REQUEST_TIMEOUT_SECONDS + " 秒",
+                            + "，超时时间：" + requestTimeoutMillis + " 毫秒",
                     exception
             );
             pendingRequestManager.completeExceptionally(requestId, timeoutException);

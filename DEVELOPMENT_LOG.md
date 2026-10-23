@@ -707,6 +707,240 @@ RPC 请求内容和次数没有变化，但 Spring 容器不再由启动类主�
 
 ---
 
+### 3.18 S5-A：接通 Consumer 全局请求超时配置
+
+- 日期：2026-10-23
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+`application.yml` 中的 `mini-rpc.request-timeout` 虽然已经能够绑定到
+`MiniRpcProperties`，但客户端等待响应时仍然使用 `NettyRpcClient` 内写死的
+5 秒常量。修改配置不会改变运行行为，容易给使用者造成误解。
+
+#### 主要修改
+
+- `NettyRpcClient` 使用 `Duration` 定义默认 5 秒超时，并新增可传入超时的构造
+  方法；旧构造方法继续使用默认值，保证早期教学代码兼容；
+- 把配置转换成毫秒保存，拒绝空值、零值、负值以及小于 1 毫秒的配置；
+- `CompletableFuture.get()` 改为使用实例自己的超时时间，超时异常同时报告实际
+  毫秒数；
+- `RpcClientFactory` 新增“ZooKeeper 地址 + 请求超时”构造方法，并将超时继续
+  传递给 `NettyRpcClient`；
+- `MiniRpcAutoConfiguration` 创建客户端工厂时，同时传入注册中心地址和
+  `MiniRpcProperties.requestTimeout`；
+- 新增测试，验证 750 毫秒能够保存到底层客户端，并拒绝零毫秒；
+- README 同步更新已生效配置、当前限制和下一步计划。
+
+#### 行为变化
+
+Consumer 现在可以通过下面的配置控制请求发出后等待响应的最长时间：
+
+```yaml
+mini-rpc:
+  request-timeout: 750ms
+```
+
+这个值只控制 RPC 响应等待，不控制 TCP 建立连接的超时。未填写配置时仍使用
+默认 5 秒，因此现有应用行为保持不变。
+
+#### 设计原因
+
+- core 使用 JDK 自带的 `Duration`，不依赖 Spring，同时可以表达毫秒和秒；
+- 保留旧构造方法，避免为了增加 Starter 配置破坏纯 Java 教学入口；
+- 当前先实现全局超时，后续再让 `@RpcReference` 支持单个服务覆盖全局值，保持
+  每一步修改范围便于审核。
+
+#### 验证与限制
+
+- 执行根工程 `mvn test`，全部模块构建成功，Starter 8 个测试全部通过；
+- 测试构造 Netty 客户端但不连接 Provider，验证配置保存和边界校验；
+- 当前还没有 `@RpcReference(timeout=...)` 单引用覆盖；
+- 下一步进入 S5-B：服务发现本地缓存和 ZooKeeper 节点变化监听。
+
+---
+
+### 3.19 S5-B-A：服务发现增加短期本地地址缓存
+
+- 日期：2026-10-23
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+此前每次 RPC 调用都会执行一次 ZooKeeper `getChildren()`。同一个 Consumer 连续
+调用同一服务时，Provider 地址通常没有变化，重复访问注册中心会增加延迟和
+ZooKeeper 压力。但在还没有节点监听时，也不能永久缓存，否则 Provider 下线后
+Consumer 会一直使用旧地址。
+
+#### 主要修改
+
+- `ZooKeeperServiceDiscovery` 新增按服务名称隔离的并发地址缓存；
+- 第一次发现服务时查询 ZooKeeper，并把不可变地址快照缓存 3 秒；
+- 3 秒内重复发现同一服务直接返回缓存，过期后自动重新查询；
+- 使用 `System.nanoTime()` 判断经过时间，避免用户调整系统时间破坏缓存有效期；
+- 使用 `ConcurrentHashMap.compute()` 按服务名称原子刷新，同一服务并发缓存失效时
+  只由一个线程访问 ZooKeeper，不同服务仍可并行刷新；
+- 关闭服务发现对象时同时清空本地缓存；
+- core 新增仅测试范围的 JUnit 与 Mockito 依赖，并新增第一组 core 单元测试；
+- README 同步更新阶段状态、服务发现行为、当前限制和后续计划。
+
+#### 行为变化
+
+假设 Consumer 在 3 秒内连续调用四次 `HelloService`：
+
+```text
+第 1 次：查询 ZooKeeper，并写入本地缓存
+第 2 次：读取本地缓存
+第 3 次：读取本地缓存
+第 4 次：读取本地缓存
+```
+
+缓存过期后的下一次调用会重新查询 ZooKeeper。不存在服务时得到的空列表也会
+短暂缓存，避免大量无效请求持续访问注册中心。
+
+#### 设计原因
+
+- 永久缓存会产生无法恢复的陈旧地址，因此在 Watch 完成前先使用短 TTL；
+- 缓存保存不可变 `List`，防止调用方修改列表导致后续负载均衡读到脏数据；
+- 本阶段不同时引入 Curator Watch，便于分别理解“缓存”和“监听”的职责。
+
+#### 验证与限制
+
+- 单元测试连续发现同一服务两次，并验证 Curator `forPath()` 只执行一次；
+- 执行根工程 `mvn test`，core 1 个、Starter 8 个测试全部通过；
+- Provider 地址变化不会立即推送给 Consumer，最迟要等 3 秒缓存过期；
+- 下一步 S5-B-B 将加入 ZooKeeper 节点监听，在 Provider 上下线时主动更新或
+  失效缓存。
+
+---
+
+### 3.20 S5-B-B：ZooKeeper Watch 主动失效地址缓存
+
+- 日期：2026-10-23
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+短期缓存减少了 ZooKeeper 查询，但仅依赖 3 秒 TTL 时，Provider 上线或下线后
+Consumer 最多要等待 3 秒才能看到变化。目标是在节点变化发生时立刻使旧缓存
+失效，同时继续保留 TTL 作为异常情况下的兜底。
+
+#### 主要修改
+
+- `ZooKeeperServiceDiscovery` 每次真正查询服务目录时，通过 Curator
+  `usingWatcher()` 注册一次性 Watch；
+- Provider 地址子节点新增或删除时，监听回调删除对应服务的本地缓存；
+- 下一次 `discover()` 因缓存缺失重新查询 ZooKeeper，并自动注册下一次 Watch；
+- 服务目录尚不存在时，改为监听目录本身的创建事件；第一个 Provider 注册后，
+  原先缓存的空地址列表会立即失效；
+- 不额外引入 `curator-recipes`，复用已有 `curator-framework` 的 Watch API；
+- 扩展 core 单元测试，模拟 `NodeChildrenChanged` 事件，验证事件后再次发现服务
+  会重新访问 ZooKeeper 并取得新地址；
+- README 同步更新阶段状态、服务发现行为、当前限制和下一步计划。
+
+#### 行为变化
+
+Provider 地址变化后的流程变为：
+
+```text
+Provider 上线或下线
+        ↓
+ZooKeeper 产生节点事件
+        ↓
+Consumer Watch 收到通知
+        ↓
+删除该服务的本地地址缓存
+        ↓
+下一次 RPC 查询最新地址并注册新 Watch
+```
+
+#### 设计原因
+
+- ZooKeeper Watch 是一次性的，因此不能收到事件后继续假设监听仍然有效；
+- 事件回调只做轻量的缓存删除，不在 ZooKeeper 回调线程中执行网络查询；
+- 下一次业务调用负责重新查询和注册 Watch，使监听生命周期容易理解；
+- TTL 与 Watch 同时保留：Watch 提供及时性，TTL 处理监听丢失或长时间无事件的
+  兜底刷新。
+
+#### 验证与限制
+
+- core 累计 2 个测试：一个验证缓存复用，一个验证 Watch 事件后重新查询；
+- 执行根工程 `mvn test`，core 2 个、Starter 8 个测试全部通过；
+- 当前监听采用“事件后失效、下次调用再刷新”，不是后台主动刷新地址；
+- 下一步优先调整 Provider 发布顺序：Netty 监听成功后再注册 ZooKeeper 地址。
+
+---
+
+### 3.21 S5-C：端口绑定成功后再发布 Provider 地址
+
+- 日期：2026-10-23
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+此前 `RpcProvider.registerService(...)` 会立即把 Provider 地址写入 ZooKeeper，
+而 Netty 端口要到之后调用 `start()` 才开始绑定。两者之间存在一个短暂窗口：
+Consumer 已经能够发现地址，但连接该地址时端口可能还没有准备好。如果端口被
+占用导致绑定彻底失败，注册中心还会短暂出现一个实际不可用的地址。
+
+#### 主要修改
+
+- `RpcProvider.registerService(...)` 现在只登记本地“接口 -> 实现对象”映射，并
+  保存稍后需要发布的服务名称；
+- `RpcServer` 新增带 `Runnable` 的启动方法，用统一回调表示“网络端口已经绑定
+  成功”，原来的无参数 `start()` 作为默认方法保留；
+- `NettyRpcServer` 在 `bind(port).sync()` 成功后执行回调，再等待 Channel 关闭；
+- 教学用 `SocketRpcServer` 在 `new ServerSocket(port)` 成功后执行同样的回调；
+- `RpcProvider.start()` 把 `publishServices()` 作为回调传给网络服务端，回调中
+  才逐个向注册中心发布地址；
+- `ServiceRegistry` 继承 `AutoCloseable` 并声明 `close()`，让 `RpcProvider` 依赖
+  注册中心抽象，而不是写死 ZooKeeper 实现；
+- 新增 `RpcProviderStartupOrderTest`，使用内存测试替身验证正常顺序和端口绑定
+  失败时的行为；
+- README 同步更新完成状态、完整启动链、调试断点和当前限制。
+
+#### 行为变化
+
+Provider 启动顺序现在是：
+
+```text
+Spring 创建 @RpcService Bean
+        ↓
+写入 Provider 本地服务表
+        ↓
+Netty 向操作系统绑定监听端口
+        ↓ 只有绑定成功才执行回调
+向 ZooKeeper 发布所有服务地址
+        ↓
+Consumer 可以发现并连接 Provider
+```
+
+如果 Netty 端口绑定失败，启动成功回调不会执行，因此不会向 ZooKeeper 发布地址。
+如果地址发布过程中失败，异常会继续向上抛出，Netty 端口和 ZooKeeper 会话都会
+在 `finally` 清理，已经创建的临时节点也会随会话关闭而消失。
+
+#### 设计原因
+
+- 回调表达的是通用的“网络已准备好”事件，Netty 和 Socket 不需要依赖 ZooKeeper；
+- 先监听、后发布可以保证“注册中心可见”意味着 Provider 至少已经能够接受连接；
+- 保留无参数 `RpcServer.start()`，旧教学代码仍然可以按原来的方式启动；
+- 使用 `ServiceRegistry` 抽象便于测试，也为以后替换其他注册中心保留边界。
+
+#### 验证与限制
+
+- 执行 `mvn -q -pl mini-rpc-core test`，core 4 个测试全部通过；
+- 执行根工程 `mvn -q test`，core 4 个、Starter 8 个测试全部通过；
+- 顺序测试验证事件严格为“本地登记 -> 端口绑定 -> 注册中心发布”；
+- 失败测试验证端口绑定失败时注册地址发布次数为 0，并正常执行资源关闭；
+- 当前测试使用内存替身验证顺序，真实 ZooKeeper + Netty 的可重复容器集成测试
+  仍是下一步。
+
+---
+
 ## 4. 接下来如何接入 Spring
 
 下一阶段不再继续发明一个自制的“客户端应用容器”。Spring 本身已经负责对象
@@ -754,8 +988,11 @@ RPC 请求内容和次数没有变化，但 Spring 容器不再由启动类主�
 
 ### S5：补齐适合 starter 的可配置和扩展能力
 
-- 服务发现本地缓存与 ZooKeeper Watch；
-- 超时、序列化器、负载均衡策略配置；
+- 状态：进行中，S5-A 全局请求超时、S5-B 缓存与 Watch、S5-C Provider 安全
+  发布顺序已完成，详细记录见 3.18～3.21；
+- 服务发现已有短期本地缓存和 ZooKeeper Watch；
+- Provider 已改为 Netty 端口绑定成功后再发布 ZooKeeper 地址；
+- 全局请求超时已接入；单引用超时、序列化器和负载均衡策略仍待配置化；
 - 条件装配和清晰的启动失败提示；
 - 重试、心跳、优雅停机与更完整的自动化测试；
 - 视学习进度再引入 SPI，不在 Spring 基础链路之前堆叠过多功能。

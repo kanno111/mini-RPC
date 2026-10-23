@@ -2,6 +2,9 @@ package com.itheima.spring.autoconfigure;
 
 import com.itheima.annotation.RpcReference;
 import com.itheima.client.RpcClientFactory;
+import com.itheima.registry.ServiceAddress;
+import com.itheima.serialize.JsonSerializer;
+import com.itheima.transport.client.NettyRpcClient;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -164,6 +167,34 @@ class MiniRpcAutoConfigurationTest {
                 new BeanWithRpcReference(),
                 "beanWithRpcReference"
         )).isSameAs(factoryRequested);
+    }
+
+    @Test
+    void shouldLetNettyClientUseConfiguredRequestTimeout() {
+        /*
+         * 构造客户端不会连接 Provider；真正 sendRequest() 时才会连接。
+         * 因此这里可以只验证 750ms 已经成为底层实际保存的等待时间。
+         */
+        try (NettyRpcClient client = new NettyRpcClient(
+                ignoredServiceName ->
+                        new ServiceAddress("127.0.0.1", 8080),
+                new JsonSerializer(),
+                Duration.ofMillis(750)
+        )) {
+            assertThat(client.getRequestTimeout())
+                    .isEqualTo(Duration.ofMillis(750));
+        }
+    }
+
+    @Test
+    void shouldRejectRequestTimeoutShorterThanOneMillisecond() {
+        assertThatThrownBy(() -> new NettyRpcClient(
+                ignoredServiceName ->
+                        new ServiceAddress("127.0.0.1", 8080),
+                new JsonSerializer(),
+                Duration.ZERO
+        ))
+                .hasMessageContaining("不能小于 1 毫秒");
     }
 
     /** 没有 RPC 引用的普通 Spring Bean。 */

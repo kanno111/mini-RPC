@@ -30,8 +30,7 @@ import org.apache.zookeeper.KeeperException;
  * <p>因此 Provider 如果崩溃，虽然来不及主动执行 unregister，ZooKeeper 仍能在
  * 会话失效后删除地址，避免 Consumer 一直取得已经不可用的服务器。</p>
  */
-public final class ZooKeeperServiceRegistry
-        implements ServiceRegistry, AutoCloseable {
+public final class ZooKeeperServiceRegistry implements ServiceRegistry {
 
     /**
      * mini-RPC 在 ZooKeeper 中保存服务信息的根路径。

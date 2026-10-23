@@ -108,7 +108,10 @@ public class MiniRpcAutoConfiguration {
     public RpcClientFactory rpcClientFactory(
             MiniRpcProperties properties
     ) {
-        return new RpcClientFactory(properties.getRegistryAddress());
+        return new RpcClientFactory(
+                properties.getRegistryAddress(),
+                properties.getRequestTimeout()
+        );
     }
 
     /** 创建 Spring Provider 使用的高层 RPC 服务端。 */

@@ -6,13 +6,14 @@ import com.itheima.provider.DefaultServiceProvider;
 import com.itheima.provider.RpcRequestHandler;
 import com.itheima.provider.ServiceProvider;
 import com.itheima.registry.ServiceAddress;
+import com.itheima.registry.ServiceRegistry;
 import com.itheima.registry.zookeeper.ZooKeeperClientFactory;
 import com.itheima.registry.zookeeper.ZooKeeperServiceRegistry;
 import com.itheima.serialize.JsonSerializer;
 import com.itheima.transport.server.NettyRpcServer;
 import com.itheima.transport.server.RpcServer;
 
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Set;
 
 /**
@@ -42,8 +43,8 @@ public final class RpcProvider implements AutoCloseable {
     /** 保存“接口名称 -> 实现对象”的当前进程本地服务表。 */
     private final ServiceProvider serviceProvider;
 
-    /** 把 Provider 地址注册到 ZooKeeper。 */
-    private final ZooKeeperServiceRegistry serviceRegistry;
+    /** 把 Provider 地址发布到注册中心，并在关闭时释放注册中心连接。 */
+    private final ServiceRegistry serviceRegistry;
 
     /** 监听端口并处理 RPC 网络请求的 Netty 服务端。 */
     private final RpcServer rpcServer;
@@ -57,7 +58,7 @@ public final class RpcProvider implements AutoCloseable {
      * <p>它主要用于判断启动前是否至少注册了一个服务，也为后续自动扫描和
      * 优雅注销保留统一的服务清单。</p>
      */
-    private final Set<String> registeredServiceNames = new HashSet<>();
+    private final Set<String> serviceNames = new LinkedHashSet<>();
 
     /** 是否已经进入过 start()；一个 Provider 实例只能启动一次。 */
     private boolean started;
@@ -108,6 +109,38 @@ public final class RpcProvider implements AutoCloseable {
     }
 
     /**
+     * 直接注入 Provider 的四个核心组件。
+     *
+     * <p>这个构造方法只向同包代码开放，主要用于单元测试：测试可以放入内存版
+     * ServiceProvider、ServiceRegistry 和 RpcServer，不需要真的启动 Netty 或
+     * 连接 ZooKeeper。正式使用仍然通过上面的公开构造方法完成组装。</p>
+     */
+    RpcProvider(
+            ServiceProvider serviceProvider,
+            ServiceRegistry serviceRegistry,
+            RpcServer rpcServer,
+            ServiceAddress serviceAddress
+    ) {
+        if (serviceProvider == null) {
+            throw new RpcException("ServiceProvider 不能为空");
+        }
+        if (serviceRegistry == null) {
+            throw new RpcException("ServiceRegistry 不能为空");
+        }
+        if (rpcServer == null) {
+            throw new RpcException("RpcServer 不能为空");
+        }
+        if (serviceAddress == null) {
+            throw new RpcException("ServiceAddress 不能为空");
+        }
+
+        this.serviceProvider = serviceProvider;
+        this.serviceRegistry = serviceRegistry;
+        this.rpcServer = rpcServer;
+        this.serviceAddress = serviceAddress;
+    }
+
+    /**
      * 自动扫描并注册指定类所在包中的 RPC 服务。
      *
      * <p>传入的 {@code packageAnchor} 叫作“包定位类”。框架并不是要把这个类
@@ -117,7 +150,7 @@ public final class RpcProvider implements AutoCloseable {
      *
      * <p>扫描器会创建所有带有 {@link RpcService} 注解的对象；随后继续调用
      * {@link #registerService(Object)}，复用已经写好的注解读取、本地服务表注册
-     * 和 ZooKeeper 注册流程。</p>
+     * 和待发布服务记录流程。</p>
      *
      * @param packageAnchor 用来确定扫描起点的类，通常传入启动类
      * @return 当前 RpcProvider
@@ -140,15 +173,15 @@ public final class RpcProvider implements AutoCloseable {
     /**
      * 注册一个可以被 Consumer 远程调用的服务实现。
      *
-     * <p>一次注册包含两个位置：</p>
+     * <p>调用这个方法时只登记当前 JVM 的本地服务表：</p>
      *
      * <ol>
-     *     <li>注册到当前 JVM 的本地服务表，服务端收到请求后才能找到实现对象；</li>
-     *     <li>把当前 Provider 地址注册到 ZooKeeper，Consumer 才能发现本实例。</li>
+     *     <li>保存“接口名称 -> 实现对象”，服务端收到请求后才能找到实现对象；</li>
+     *     <li>记录待发布的服务名称，但暂时不写入 ZooKeeper。</li>
      * </ol>
      *
-     * <p>如果 ZooKeeper 注册失败，会撤销已经写入本地服务表的数据，避免出现
-     * “本地认为已经注册，但 Consumer 无法发现”的半完成状态。</p>
+     * <p>真正写入 ZooKeeper 会推迟到 {@link #start()} 中，而且必须等 Netty
+     * 端口绑定成功。这样 Consumer 不会发现一个尚未能够建立连接的地址。</p>
      *
      * @param serviceInterface 对外共享的服务接口
      * @param service          真正执行业务方法的接口实现对象
@@ -183,7 +216,7 @@ public final class RpcProvider implements AutoCloseable {
      *     <li>取得实现对象的 {@link Class}；</li>
      *     <li>从 Class 上读取 {@link RpcService} 注解；</li>
      *     <li>从注解中取得要暴露的接口；</li>
-     *     <li>复用原来的注册流程完成本地注册和 ZooKeeper 注册。</li>
+     *     <li>复用原来的登记流程，写入本地服务表并记录服务名称。</li>
      * </ol>
      *
      * @param service 带有 {@link RpcService} 注解的服务实现对象
@@ -214,7 +247,7 @@ public final class RpcProvider implements AutoCloseable {
     }
 
     /**
-     * 执行本地服务表和 ZooKeeper 的公共注册流程。
+     * 执行本地服务表登记，并记录启动后需要发布的服务名称。
      *
      * <p>两个公开的 registerService 方法只是用不同方式取得接口类型，真正的
      * 注册动作集中在这里，避免复制同一段代码。</p>
@@ -227,14 +260,8 @@ public final class RpcProvider implements AutoCloseable {
         serviceProvider.registerService(serviceInterface, service);
         String serviceName = serviceInterface.getName();
 
-        try {
-            serviceRegistry.register(serviceName, serviceAddress);
-            registeredServiceNames.add(serviceName);
-            return this;
-        } catch (RuntimeException exception) {
-            serviceProvider.removeService(serviceName);
-            throw exception;
-        }
+        serviceNames.add(serviceName);
+        return this;
     }
 
     /**
@@ -251,7 +278,7 @@ public final class RpcProvider implements AutoCloseable {
             if (started) {
                 throw new RpcException("RpcProvider 只能启动一次");
             }
-            if (registeredServiceNames.isEmpty()) {
+            if (serviceNames.isEmpty()) {
                 throw new RpcException("启动 RpcProvider 前至少要注册一个服务");
             }
 
@@ -267,13 +294,31 @@ public final class RpcProvider implements AutoCloseable {
         );
 
         try {
-            rpcServer.start();
+            /*
+             * RpcServer 先绑定操作系统端口。绑定成功后，它才会执行
+             * publishServices()；所以 ZooKeeper 中出现地址时，Netty 已经具备
+             * 接受连接的能力。
+             */
+            rpcServer.start(this::publishServices);
         } finally {
             /*
              * 无论是正常停止、线程中断，还是端口绑定失败，都要关闭注册中心。
              * ZooKeeper 会话关闭后，当前实例的临时地址节点会被自动删除。
              */
             close();
+        }
+    }
+
+    /**
+     * 把当前 Provider 已登记的全部服务发布到注册中心。
+     *
+     * <p>该方法由 RpcServer 在端口绑定成功后回调。若任意一次注册失败，异常会
+     * 沿调用链返回，RpcServer 会关闭刚绑定的端口，RpcProvider 的 finally 还会
+     * 关闭注册中心会话，从而清理本次可能已经创建的临时节点。</p>
+     */
+    private void publishServices() {
+        for (String serviceName : serviceNames) {
+            serviceRegistry.register(serviceName, serviceAddress);
         }
     }
 

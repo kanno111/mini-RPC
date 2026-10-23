@@ -35,7 +35,26 @@ public interface RpcServer {
      *
      * @throws RpcException 端口绑定失败、服务端已经启动或监听过程异常时抛出
      */
-    void start();
+    default void start() {
+        start(() -> {
+            // 不需要监听启动完成事件时，使用空回调保持原来的调用方式。
+        });
+    }
+
+    /**
+     * 启动 RPC 服务端，并在网络端口真正绑定成功后执行回调。
+     *
+     * <p>这里的“绑定成功”非常重要：只有操作系统已经允许当前进程监听该端口，
+     * Consumer 才有可能建立连接。Provider 可以利用这个时间点，把自己的地址
+     * 发布到 ZooKeeper，避免出现“注册中心有地址，但端口还没有启动”的假在线状态。</p>
+     *
+     * <p>回调是通用的 {@link Runnable}，网络层并不知道回调内部会操作 ZooKeeper。
+     * 这样 Netty、JDK Socket 和注册中心仍然彼此独立。</p>
+     *
+     * @param onStarted 端口绑定成功后执行的回调，不能为 null
+     * @throws RpcException 端口绑定失败、回调执行失败或监听过程异常时抛出
+     */
+    void start(Runnable onStarted);
 
     /**
      * 停止 RPC 服务端并释放资源。

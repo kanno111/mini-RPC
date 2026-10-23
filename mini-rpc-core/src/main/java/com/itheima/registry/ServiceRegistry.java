@@ -23,7 +23,7 @@ import com.itheima.common.RpcException;
  *     <li>ServiceRegistry 保存“接口名 → Provider 的网络地址”。</li>
  * </ul>
  */
-public interface ServiceRegistry {
+public interface ServiceRegistry extends AutoCloseable {
 
     /**
      * 注册一个可以提供指定服务的网络地址。
@@ -47,4 +47,14 @@ public interface ServiceRegistry {
      * @throws RpcException 参数无效或注册中心操作失败时抛出
      */
     void unregister(String serviceName, ServiceAddress address);
+
+    /**
+     * 关闭注册中心客户端以及它持有的网络连接。
+     *
+     * <p>把关闭能力定义在接口上后，RpcProvider 可以只依赖抽象接口，
+     * 不必写死 ZooKeeper 实现。这也让测试可以使用不会连接真实 ZooKeeper 的
+     * 内存替身。</p>
+     */
+    @Override
+    void close();
 }
