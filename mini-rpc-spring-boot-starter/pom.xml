@@ -24,10 +24,13 @@
             <artifactId>mini-rpc-core</artifactId>
         </dependency>
 
-        <!-- 提供 @AutoConfiguration、配置绑定和条件装配等自动配置能力。 -->
+        <!--
+            Spring Boot 基础 Starter 同时提供自动配置、SpringApplication、日志
+            以及 YAML 配置支持，业务应用引入 mini-RPC Starter 后无需重复添加。
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-autoconfigure</artifactId>
+            <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
         <!--

@@ -14,14 +14,16 @@ import java.time.Duration;
  *   enabled: true
  *   registry-address: 127.0.0.1:2181
  *   request-timeout: 5s
+ *   provider-enabled: false
+ *   server-host: 127.0.0.1
  *   server-port: 8080
  * }</pre>
  *
- * <p>自动绑定到本类的四个字段。这里的“绑定”可以简单理解为：Spring 读取
+ * <p>自动绑定到本类的各个字段。这里的“绑定”可以简单理解为：Spring 读取
  * 配置文件，然后调用对应的 setter 把值写入 Java 对象。</p>
  *
- * <p>当前 S1 只证明配置能够被读取，还不会使用这些配置启动 ZooKeeper 或
- * Netty。后续阶段再逐项接入，避免一次引入太多逻辑。</p>
+ * <p>目前注册中心地址、Provider 开关、主机和端口已经接入自动配置；
+ * {@code requestTimeout} 已能被读取，但还没有传入底层客户端。</p>
  */
 @ConfigurationProperties(prefix = "mini-rpc")
 public class MiniRpcProperties {
@@ -34,6 +36,12 @@ public class MiniRpcProperties {
 
     /** Consumer 等待一次 RPC 响应的最长时间。 */
     private Duration requestTimeout = Duration.ofSeconds(5);
+
+    /** 是否把当前 Spring Boot 应用作为 RPC Provider 启动。 */
+    private boolean providerEnabled;
+
+    /** Provider 注册到 ZooKeeper、供 Consumer 访问的主机地址。 */
+    private String serverHost = "127.0.0.1";
 
     /** Provider 对外监听的 Netty 端口。 */
     private int serverPort = 8080;
@@ -60,6 +68,22 @@ public class MiniRpcProperties {
 
     public void setRequestTimeout(Duration requestTimeout) {
         this.requestTimeout = requestTimeout;
+    }
+
+    public boolean isProviderEnabled() {
+        return providerEnabled;
+    }
+
+    public void setProviderEnabled(boolean providerEnabled) {
+        this.providerEnabled = providerEnabled;
+    }
+
+    public String getServerHost() {
+        return serverHost;
+    }
+
+    public void setServerHost(String serverHost) {
+        this.serverHost = serverHost;
     }
 
     public int getServerPort() {

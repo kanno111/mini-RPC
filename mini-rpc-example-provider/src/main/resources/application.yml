@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: mini-rpc-example-provider
+
+mini-rpc:
+  enabled: true
+  provider-enabled: true
+  registry-address: 127.0.0.1:2181
+  server-host: 127.0.0.1
+  server-port: 8080

@@ -18,7 +18,7 @@
         <!-- 服务端需要使用 RPC 框架启动 Socket 服务并处理请求。 -->
         <dependency>
             <groupId>com.itheima</groupId>
-            <artifactId>mini-rpc-core</artifactId>
+            <artifactId>mini-rpc-spring-boot-starter</artifactId>
         </dependency>
 
         <!-- 服务端实现 API 模块定义的 HelloService 接口。 -->

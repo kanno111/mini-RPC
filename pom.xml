@@ -57,6 +57,11 @@
             </dependency>
             <dependency>
                 <groupId>com.itheima</groupId>
+                <artifactId>mini-rpc-spring-boot-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.itheima</groupId>
                 <artifactId>mini-rpc-example-api</artifactId>
                 <version>${project.version}</version>
             </dependency>

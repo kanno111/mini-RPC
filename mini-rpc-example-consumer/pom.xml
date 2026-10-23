@@ -18,7 +18,7 @@
         <!-- 客户端需要 RPC 框架来创建代理并发送 Socket 请求。 -->
         <dependency>
             <groupId>com.itheima</groupId>
-            <artifactId>mini-rpc-core</artifactId>
+            <artifactId>mini-rpc-spring-boot-starter</artifactId>
         </dependency>
 
         <!--

@@ -12,18 +12,17 @@ import com.itheima.example.api.HelloService;
 @RpcService(serviceInterface = HelloService.class)
 public class HelloServiceImpl implements HelloService {
 
-    /** 当前 Provider 的进程 ID，用于区分同时启动的多个服务实例。 */
-    private final long providerProcessId;
+    /** 由 Spring 通过构造方法注入的业务依赖。 */
+    private final ProviderIdentity providerIdentity;
 
     /**
-     * 公开的无参构造方法，供 RPC 自动扫描器创建服务对象。
+     * Spring 创建 HelloServiceImpl 时，会自动查找 ProviderIdentity Bean 并传入。
      *
-     * <p>当前 mini-RPC 还没有 Spring 那样的依赖注入容器，因此扫描器暂时
-     * 只能调用公开的无参构造方法。这里记录进程 ID，只是为了启动两个 Provider
-     * 时能从响应中看出请求到达了不同的进程，与 RPC 核心逻辑无关。</p>
+     * <p>这个类故意不再提供无参构造方法，用来证明服务对象已经由 Spring
+     * 创建，而不是由旧版 RpcServiceScanner 反射 new 出来。</p>
      */
-    public HelloServiceImpl() {
-        this.providerProcessId = ProcessHandle.current().pid();
+    public HelloServiceImpl(ProviderIdentity providerIdentity) {
+        this.providerIdentity = providerIdentity;
     }
 
     /**
@@ -38,7 +37,7 @@ public class HelloServiceImpl implements HelloService {
     @Override
     public String sayHello(String name) {
         return "你好，" + name + "！这是 Provider 进程 "
-                + providerProcessId
+                + providerIdentity.getProcessId()
                 + " 返回的 RPC 响应。";
     }
 }
