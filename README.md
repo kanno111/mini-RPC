@@ -6,8 +6,17 @@ mini-RPC 是一个使用 Java 21 编写的学习型 RPC 框架。项目从最基
 Socket 阻塞通信开始，逐步演进到当前的 Netty、自定义协议、JSON 序列化、
 ZooKeeper 服务注册与发现、轮询负载均衡和服务端注解扫描。
 
-这个项目当前关注的是“把 RPC 的完整链路真正跑通并理解每一层为什么存在”，
-而不是直接实现一个可以替代 Dubbo 或 OpenFeign 的生产级框架。
+这个项目当前关注的是“把 RPC 的完整链路真正跑通并理解每一层为什么存在”。
+在理解核心链路之后，最终目标是封装成 Spring Boot Starter，提供接近
+OpenFeign 的开箱即用体验；它仍然是学习型项目，不宣称替代 Dubbo、gRPC 或
+OpenFeign 的生产能力。
+
+文档分工如下：
+
+- [README.md](README.md)：当前结构、使用方法和调用链；
+- [process.md](process.md)：项目最初的分阶段规划；
+- [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)：实际完成的每个阶段、修改原因、
+  验证结果和后续限制。此后每次修改都必须同步更新该文档。
 
 当前默认调用链使用：
 
@@ -36,11 +45,15 @@ JDK 动态代理
 | M3 | 20 字节协议头、编解码器、JSON 序列化 | 已完成 |
 | M4 | ZooKeeper 注册发现、轮询负载均衡 | 已完成基础版本 |
 | M4 | `@RpcService` 扫描并自动注册服务端实现 | 已完成 |
-| M4 | `@RpcReference` 自动注入客户端代理 | 尚未实现 |
+| M4 | `@RpcReference` 字段代理注入 | 已完成基础版本 |
 | M4 | 服务发现本地缓存和 ZooKeeper 节点监听 | 尚未实现 |
+| S1 | Spring Boot Starter、自动配置和配置绑定骨架 | 已完成 |
+| S2 | Spring 自动注入 `@RpcReference` | 尚未开始 |
+| S3 | Spring Bean 形式的 `@RpcService` 自动发布 | 尚未开始 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
-详细的分阶段原始规划参见 [process.md](process.md)。
+详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
+[DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)。
 
 ---
 
@@ -54,6 +67,7 @@ mini-RPC
 ├── process.md
 ├── README.md
 ├── mini-rpc-core
+├── mini-rpc-spring-boot-starter
 ├── mini-rpc-example-api
 ├── mini-rpc-example-provider
 └── mini-rpc-example-consumer
@@ -89,6 +103,7 @@ mini-RPC
 - consumer 依赖 `core + api`；
 - consumer 不依赖 provider，因此客户端看不到 `HelloServiceImpl`；
 - core 不依赖任何 example 模块，因此框架不包含具体业务代码；
+- starter 依赖 core 和 Spring Boot，负责把现有 RPC 能力接入 Spring 容器；
 - api 不依赖 core，也不依赖第三方框架，只保存双方共享的契约。
 
 ### 3.1 根项目
@@ -97,7 +112,7 @@ mini-RPC
 
 它主要负责：
 
-- 声明四个子模块；
+- 声明五个子模块；
 - 统一 Java 版本为 Java 21；
 - 统一管理各项依赖的版本；
 - 在根目录执行 Maven 命令时按顺序构建所有模块。
@@ -109,7 +124,32 @@ mini-RPC
 
 真实业务项目以后只需要依赖这个模块，而不应该复制其中的代码。
 
-### 3.3 mini-rpc-example-api
+### 3.3 mini-rpc-spring-boot-starter
+
+这是正在建设的 Spring 集成层。当前 S1 只包含：
+
+- `MiniRpcProperties`：接收 `mini-rpc.*` 配置；
+- `MiniRpcAutoConfiguration`：Spring Boot 自动配置入口；
+- `AutoConfiguration.imports`：让 Spring Boot 能自动发现配置入口；
+- 最小自动配置测试。
+
+这个模块当前不会启动 Netty，也不会连接 ZooKeeper。下一阶段才会让 Spring 自动
+处理 `@RpcReference`。示例应用暂时仍直接依赖 core，等 Spring 调用链完整后再
+整体切换，避免同一个示例处于一半手动、一半自动的状态。
+
+当前已经可以识别的配置形式如下：
+
+```yaml
+mini-rpc:
+  enabled: true
+  registry-address: 127.0.0.1:2181
+  request-timeout: 5s
+  server-port: 8080
+```
+
+注意：S1 只会读取这些值，并不会使用它们启动 RPC 组件。
+
+### 3.4 mini-rpc-example-api
 
 这是客户端和服务端共同依赖的“契约模块”。目前只包含：
 
@@ -119,14 +159,14 @@ HelloService.java
 
 如果业务方法使用自定义的请求或响应对象，这些公共 DTO 也应该放在 API 模块。
 
-### 3.4 mini-rpc-example-provider
+### 3.5 mini-rpc-example-provider
 
 这是服务提供者示例应用，包含：
 
 - `HelloServiceImpl`：`HelloService` 的真正业务实现；
 - `ProviderMain`：创建 `RpcProvider`、扫描服务并启动 Netty。
 
-### 3.5 mini-rpc-example-consumer
+### 3.6 mini-rpc-example-consumer
 
 这是服务消费者示例应用，目前只包含 `ConsumerMain`。
 
@@ -157,6 +197,7 @@ com.itheima
 | 类 | 作用 |
 |---|---|
 | `RpcService` | 标记一个类是 RPC 服务实现，并指定要暴露的公共接口 |
+| `RpcReference` | 标记 Consumer 中需要注入 RPC 动态代理的接口字段 |
 
 示例：
 
@@ -311,18 +352,31 @@ rpcClient.sendRequest(request)
 | 类 | 作用 |
 |---|---|
 | `RpcClientFactory` | 统一组装发现、负载均衡、Netty、序列化和动态代理 |
+| `RpcReferenceInjector` | 查找 `@RpcReference` 字段并通过反射注入动态代理 |
 
 客户端业务只需要：
 
 ```java
+public class ConsumerApplication {
+
+    @RpcReference
+    private HelloService helloService;
+
+    public void run() {
+        helloService.sayHello("world");
+    }
+}
+
+ConsumerApplication application = new ConsumerApplication();
 try (RpcClientFactory factory = new RpcClientFactory()) {
-    HelloService helloService = factory.createProxy(HelloService.class);
-    String result = helloService.sayHello("world");
+    factory.injectReferences(application);
+    application.run();
 }
 ```
 
-当前仍需手动调用 `createProxy()`。后续实现 `@RpcReference` 后，可以进一步
-自动向业务字段注入代理对象。
+当前已经不需要为每个接口手动调用 `createProxy()`，但仍要手动创建业务对象并
+调用一次 `injectReferences()`。后续会增加更高层的客户端启动入口，把这两步也
+交给框架管理。
 
 ### 4.10 server：服务端高层入口
 
@@ -666,6 +720,15 @@ Consumer 会连续调用四次。如果 8080 和 8081 都已注册，可以在�
 7. `ZooKeeperServiceRegistry.register(...)`；
 8. `NettyRpcServer.start()`。
 
+### Consumer 注入代理
+
+1. `ConsumerMain`：`factory.injectReferences(application)`；
+2. `RpcClientFactory.injectReferences(...)`；
+3. `RpcReferenceInjector.inject(...)`；
+4. `RpcReferenceInjector.validateReferenceField(...)`；
+5. `RpcClientProxy.createProxy(...)`；
+6. `RpcReferenceInjector.setFieldValue(...)`。
+
 ### Consumer 发起请求
 
 1. `ConsumerMain`：`helloService.sayHello(...)`；
@@ -702,7 +765,7 @@ Consumer 会连续调用四次。如果 8080 和 8081 都已注册，可以在�
 当前实现适合学习和本地演示，还存在以下限制：
 
 1. 服务实现类必须提供公开无参构造方法，尚未接入 Spring 依赖注入；
-2. 客户端需要手动调用 `factory.createProxy()`，尚未实现 `@RpcReference`；
+2. `@RpcReference` 已能注入代理，但仍需手动创建业务对象并调用注入方法；
 3. 服务发现每次请求都会访问 ZooKeeper，没有本地缓存和节点监听；
 4. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
 5. 协议预留了心跳消息类型，但尚未实现心跳检测；
@@ -716,15 +779,19 @@ Consumer 会连续调用四次。如果 8080 和 8081 都已注册，可以在�
 
 ## 12. 下一步演进方向
 
-为了逐步接近“类似 OpenFeign、开箱即用”的最终目标，推荐按以下顺序继续：
+下一阶段直接转向 Spring 集成，不再继续扩展自制的“客户端应用容器”。推荐按
+以下顺序继续：
 
-1. 增加 `@RpcReference` 注解；
-2. 扫描 Consumer 中标记的字段并自动注入动态代理；
-3. 抽取统一配置对象，集中管理端口、ZooKeeper、超时和序列化方式；
-4. 为服务发现增加本地缓存和 ZooKeeper 节点监听；
-5. 增加自动化测试；
-6. 接入 Spring 容器，让服务对象和客户端代理交给 Spring 管理；
-7. 最终封装为 Spring Boot Starter。
+1. 新增 `mini-rpc-spring-boot-starter` 模块和自动配置骨架；
+2. 新增统一配置对象，读取 `mini-rpc.*` 配置；
+3. 使用 Spring `BeanPostProcessor` 自动注入 `@RpcReference`；
+4. 从 Spring 容器获取 `@RpcService` Bean，支持正常的 Spring 依赖注入；
+5. 让 Spring 管理 Netty、ZooKeeper 和客户端工厂的启动、关闭生命周期；
+6. 把 Provider、Consumer 示例改造成真正的 Spring Boot 应用并增加集成测试；
+7. 再逐步加入服务发现缓存、节点监听、重试、心跳和 SPI 等能力。
+
+更细的 Spring 分步计划参见
+[DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。
 
 目标使用体验可以逐步演进为：
 

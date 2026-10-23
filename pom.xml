@@ -14,9 +14,10 @@
     -->
     <packaging>pom</packaging>
 
-    <!-- 在根目录执行 Maven 命令时，这四个模块会一起参与构建。 -->
+    <!-- 在根目录执行 Maven 命令时，下面五个模块会一起参与构建。 -->
     <modules>
         <module>mini-rpc-core</module>
+        <module>mini-rpc-spring-boot-starter</module>
         <module>mini-rpc-example-api</module>
         <module>mini-rpc-example-provider</module>
         <module>mini-rpc-example-consumer</module>
@@ -38,6 +39,8 @@
         <curator.version>5.9.0</curator.version>
         <!-- ClassGraph 用来扫描类路径，查找带有 @RpcService 的业务类。 -->
         <classgraph.version>5.0.0</classgraph.version>
+        <!-- Spring Boot 为后续 Starter、自动配置和 Spring 生命周期集成提供基础。 -->
+        <spring-boot.version>3.5.7</spring-boot.version>
     </properties>
 
     <!--
@@ -56,6 +59,50 @@
                 <groupId>com.itheima</groupId>
                 <artifactId>mini-rpc-example-api</artifactId>
                 <version>${project.version}</version>
+            </dependency>
+
+            <!--
+                本项目已经使用 Netty 4.2 API。这里先导入 Netty 自己的 BOM，确保
+                netty-all 拆分出来的所有子模块保持同一个 4.2 版本，避免后面的
+                Spring Boot BOM 把部分子模块改成 4.1，形成不可编译的混合版本。
+            -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- Jackson 由多个必须互相兼容的 Jar 组成，使用 BOM 保持版本一致。 -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- 同理，SLF4J API 与各种日志桥接器也统一使用同一版本。 -->
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-bom</artifactId>
+                <version>${slf4j.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!--
+                导入 Spring Boot 的依赖清单，让 Starter 模块中的 Spring 相关依赖
+                使用彼此兼容的一组版本。type=pom + scope=import 表示只导入版本表，
+                并不会把所有 Spring Boot Jar 都加入项目。
+            -->
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
 
             <!-- 第三方依赖。 -->
@@ -77,6 +124,11 @@
             <dependency>
                 <groupId>ch.qos.logback</groupId>
                 <artifactId>logback-classic</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-core</artifactId>
                 <version>${logback.version}</version>
             </dependency>
             <dependency>

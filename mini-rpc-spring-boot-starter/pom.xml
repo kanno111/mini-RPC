@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.itheima</groupId>
+        <artifactId>mini-rpc-parent</artifactId>
+        <version>1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>mini-rpc-spring-boot-starter</artifactId>
+    <name>mini-rpc-spring-boot-starter</name>
+
+    <dependencies>
+        <!--
+            Starter 最终要把 Spring 容器和现有 RPC 能力连接起来，所以它依赖
+            core；core 反过来不依赖 Spring，原来的纯 Java 用法仍然可以保留。
+        -->
+        <dependency>
+            <groupId>com.itheima</groupId>
+            <artifactId>mini-rpc-core</artifactId>
+        </dependency>
+
+        <!-- 提供 @AutoConfiguration、配置绑定和条件装配等自动配置能力。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+        </dependency>
+
+        <!--
+            编译时生成配置项元数据。IDE 读取元数据后，可以在 application.yml
+            中为 mini-rpc.* 配置提供提示；它不会参与程序运行。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 测试自动配置是否能创建 Spring 上下文并绑定属性。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

@@ -36,8 +36,9 @@ import com.itheima.transport.client.NettyRpcClient;
  * }
  * }</pre>
  *
- * <p>这还不是最终的注解自动注入版本，但已经把客户端的底层组装集中在
- * 一个入口中。后续实现 {@code @RpcReference} 时，也会复用这个入口。</p>
+ * <p>除了直接调用 {@link #createProxy(Class)}，还可以使用
+ * {@link #injectReferences(Object)}，让框架为业务对象中标记了
+ * {@code @RpcReference} 的字段自动注入代理。</p>
  */
 public final class RpcClientFactory implements AutoCloseable {
 
@@ -115,6 +116,29 @@ public final class RpcClientFactory implements AutoCloseable {
             throw new RpcException("已经关闭的 RpcClientFactory 不能创建代理");
         }
         return proxyFactory.createProxy(serviceInterface);
+    }
+
+    /**
+     * 为业务对象中带有 {@code @RpcReference} 的字段注入 RPC 动态代理。
+     *
+     * <p>例如业务对象中声明：</p>
+     *
+     * <pre>{@code
+     * @RpcReference
+     * private HelloService helloService;
+     * }</pre>
+     *
+     * <p>调用本方法后，{@code helloService} 会指向一个 JDK 动态代理。注入过程
+     * 本身不会连接 Provider；第一次调用代理方法时才会查询 ZooKeeper 并建立
+     * 或复用 Netty 连接。</p>
+     *
+     * @param target 包含 RPC 引用字段的业务对象
+     */
+    public void injectReferences(Object target) {
+        if (closed) {
+            throw new RpcException("已经关闭的 RpcClientFactory 不能注入 RPC 引用");
+        }
+        new RpcReferenceInjector(this).inject(target);
     }
 
     /**
