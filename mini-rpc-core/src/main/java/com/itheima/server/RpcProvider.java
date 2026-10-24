@@ -14,7 +14,9 @@ import com.itheima.serialize.Serializer;
 import com.itheima.transport.server.NettyRpcServer;
 import com.itheima.transport.server.RpcServer;
 
+import java.time.Duration;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -60,6 +62,15 @@ public final class RpcProvider implements AutoCloseable {
      * 优雅注销保留统一的服务清单。</p>
      */
     private final Set<String> serviceNames = new LinkedHashSet<>();
+
+    /**
+     * 已经成功发布到注册中心的服务名称。
+     *
+     * <p>{@link #serviceNames} 表示本地准备提供什么服务，本集合表示哪些地址节点
+     * 已经真正创建成功。关闭时只主动注销后者，避免端口绑定失败时对一个从未发布
+     * 的地址执行多余删除，也能正确清理“发布到一半失败”的部分结果。</p>
+     */
+    private final Set<String> publishedServiceNames = new LinkedHashSet<>();
 
     /** 是否已经进入过 start()；一个 Provider 实例只能启动一次。 */
     private boolean started;
@@ -116,6 +127,29 @@ public final class RpcProvider implements AutoCloseable {
             String zooKeeperAddress,
             Serializer serializer
     ) {
+        this(
+                host,
+                port,
+                zooKeeperAddress,
+                serializer,
+                NettyRpcServer.DEFAULT_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    /**
+     * 使用指定序列化器和关闭排空时间创建 Provider。
+     *
+     * <p>Starter 使用这个构造方法把 {@code mini-rpc.shutdown-timeout} 一直传到
+     * Netty 服务端。超时只控制关闭时等待已开始请求的时间，不影响普通 RPC 请求
+     * 的 Consumer 响应超时。</p>
+     */
+    public RpcProvider(
+            String host,
+            int port,
+            String zooKeeperAddress,
+            Serializer serializer,
+            Duration shutdownTimeout
+    ) {
         this.serviceAddress = new ServiceAddress(host, port);
         this.serviceProvider = new DefaultServiceProvider();
 
@@ -124,7 +158,8 @@ public final class RpcProvider implements AutoCloseable {
         this.rpcServer = new NettyRpcServer(
                 port,
                 serializer,
-                requestHandler
+                requestHandler,
+                shutdownTimeout
         );
         this.serviceRegistry =
                 new ZooKeeperServiceRegistry(zooKeeperAddress);
@@ -338,9 +373,18 @@ public final class RpcProvider implements AutoCloseable {
      * 沿调用链返回，RpcServer 会关闭刚绑定的端口，RpcProvider 的 finally 还会
      * 关闭注册中心会话，从而清理本次可能已经创建的临时节点。</p>
      */
-    private void publishServices() {
+    private synchronized void publishServices() {
+        if (closed) {
+            throw new RpcException("已经关闭的 RpcProvider 不能发布服务");
+        }
+
         for (String serviceName : serviceNames) {
             serviceRegistry.register(serviceName, serviceAddress);
+            /*
+             * 必须在 register 成功返回后再记录。如果第二个服务发布失败，前面已经
+             * 成功的服务仍会留在集合中，随后 close() 可以主动注销这些部分结果。
+             */
+            publishedServiceNames.add(serviceName);
         }
     }
 
@@ -355,23 +399,76 @@ public final class RpcProvider implements AutoCloseable {
     }
 
     /**
-     * 停止 Netty 并关闭 ZooKeeper 会话。
+     * 按“先摘流、再停服务、最后关注册中心”的顺序关闭 Provider。
      *
-     * <p>方法是幂等的，也就是调用多次和调用一次效果相同。</p>
+     * <ol>
+     *     <li>主动注销已经发布的地址，让 Consumer 的 Watch 尽快失效旧缓存；</li>
+     *     <li>停止 Netty 监听，并等待 Netty worker 优雅结束正在执行的任务；</li>
+     *     <li>关闭 ZooKeeper 会话，作为临时节点清理的最终兜底。</li>
+     * </ol>
+     *
+     * <p>方法是幂等的，也就是调用多次和调用一次效果相同。即使某一步失败，后续
+     * 资源仍会继续释放；最后再抛出第一个异常，并把其他清理异常附加进去。</p>
      */
     @Override
     public void close() {
+        List<String> servicesToUnregister;
+
         synchronized (this) {
             if (closed) {
                 return;
             }
             closed = true;
+            servicesToUnregister = List.copyOf(publishedServiceNames);
+            publishedServiceNames.clear();
+        }
+
+        RuntimeException cleanupFailure = null;
+
+        for (String serviceName : servicesToUnregister) {
+            try {
+                serviceRegistry.unregister(serviceName, serviceAddress);
+            } catch (RuntimeException exception) {
+                cleanupFailure = mergeCleanupFailure(
+                        cleanupFailure,
+                        exception
+                );
+            }
         }
 
         try {
             rpcServer.stop();
-        } finally {
-            serviceRegistry.close();
+        } catch (RuntimeException exception) {
+            cleanupFailure = mergeCleanupFailure(
+                    cleanupFailure,
+                    exception
+            );
         }
+
+        try {
+            serviceRegistry.close();
+        } catch (RuntimeException exception) {
+            cleanupFailure = mergeCleanupFailure(
+                    cleanupFailure,
+                    exception
+            );
+        }
+
+        if (cleanupFailure != null) {
+            throw cleanupFailure;
+        }
+    }
+
+    /** 保留第一次清理失败，并把后续失败作为 suppressed 异常附加。 */
+    private RuntimeException mergeCleanupFailure(
+            RuntimeException firstFailure,
+            RuntimeException nextFailure
+    ) {
+        if (firstFailure == null) {
+            return nextFailure;
+        }
+
+        firstFailure.addSuppressed(nextFailure);
+        return firstFailure;
     }
 }

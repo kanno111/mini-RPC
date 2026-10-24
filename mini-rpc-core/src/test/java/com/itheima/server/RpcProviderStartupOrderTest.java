@@ -54,6 +54,7 @@ class RpcProviderStartupOrderTest {
                         "local-register",
                         "port-bound",
                         "registry-register",
+                        "registry-unregister",
                         "server-stop",
                         "registry-close"
                 ),
@@ -84,6 +85,41 @@ class RpcProviderStartupOrderTest {
                 List.of(
                         "local-register",
                         "bind-failed",
+                        "server-stop",
+                        "registry-close"
+                ),
+                events
+        );
+    }
+
+    @Test
+    void shouldContinueCleanupWhenUnregisterFails() {
+        List<String> events = new ArrayList<>();
+        RecordingServiceRegistry serviceRegistry =
+                new RecordingServiceRegistry(events, true);
+        RpcProvider provider = new RpcProvider(
+                new RecordingServiceProvider(events),
+                serviceRegistry,
+                new RecordingRpcServer(events, false),
+                new ServiceAddress("127.0.0.1", 8080)
+        );
+
+        provider.registerService(Runnable.class, () -> {
+            // 测试只需要让服务进入待发布列表。
+        });
+
+        RpcException exception = assertThrows(
+                RpcException.class,
+                provider::start
+        );
+
+        assertEquals("模拟注销失败", exception.getMessage());
+        assertEquals(
+                List.of(
+                        "local-register",
+                        "port-bound",
+                        "registry-register",
+                        "registry-unregister",
                         "server-stop",
                         "registry-close"
                 ),
@@ -125,10 +161,19 @@ class RpcProviderStartupOrderTest {
             implements ServiceRegistry {
 
         private final List<String> events;
+        private final boolean failUnregister;
         private int registerCount;
 
         private RecordingServiceRegistry(List<String> events) {
+            this(events, false);
+        }
+
+        private RecordingServiceRegistry(
+                List<String> events,
+                boolean failUnregister
+        ) {
             this.events = events;
+            this.failUnregister = failUnregister;
         }
 
         @Override
@@ -146,6 +191,9 @@ class RpcProviderStartupOrderTest {
                 ServiceAddress address
         ) {
             events.add("registry-unregister");
+            if (failUnregister) {
+                throw new RpcException("模拟注销失败");
+            }
         }
 
         @Override

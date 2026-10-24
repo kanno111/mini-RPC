@@ -39,16 +39,31 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
     /** 负责真正的服务查找、反射调用和响应封装。 */
     private final RpcRequestHandler requestHandler;
 
+    /** 统计已进入业务执行、但响应写入尚未完成的请求。 */
+    private final InFlightRequestTracker requestTracker;
+
     /**
      * 创建 Netty 服务端业务处理器。
      *
      * @param requestHandler 已经配置好服务注册表的请求执行器，不能为 {@code null}
      */
     public NettyRpcServerHandler(RpcRequestHandler requestHandler) {
+        this(requestHandler, new InFlightRequestTracker());
+    }
+
+    /** 让 NettyRpcServer 和 Handler 共享同一个在途请求计数器。 */
+    NettyRpcServerHandler(
+            RpcRequestHandler requestHandler,
+            InFlightRequestTracker requestTracker
+    ) {
         if (requestHandler == null) {
             throw new RpcException("RpcRequestHandler 不能为空");
         }
+        if (requestTracker == null) {
+            throw new RpcException("InFlightRequestTracker 不能为空");
+        }
         this.requestHandler = requestHandler;
+        this.requestTracker = requestTracker;
     }
 
     /**
@@ -63,8 +78,30 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
      */
     @Override
     protected void channelRead0(ChannelHandlerContext context, RpcRequest request) {
+        if (!requestTracker.tryStartRequest()) {
+            /*
+             * 连接可能在 Provider 摘流前已经建立。开始排空后，这些旧连接仍可能
+             * 发来请求；这里返回失败响应，而不是继续执行新的业务方法。
+             */
+            context.writeAndFlush(RpcResponse.failure(
+                    request.getRequestId(),
+                    new RpcException("RPC Provider 正在关闭，拒绝新的请求")
+            ));
+            return;
+        }
+
         // 第一步：复用 M1 已有逻辑，查找服务并反射执行目标方法。
-        RpcResponse response = requestHandler.handle(request);
+        RpcResponse response;
+        try {
+            response = requestHandler.handle(request);
+        } catch (RuntimeException exception) {
+            /*
+             * 正常业务异常会由 RpcRequestHandler 转换成失败响应；这里防守其自身
+             * 意外抛出的运行时异常，确保计数不会永远无法归零。
+             */
+            requestTracker.finishRequest();
+            throw exception;
+        }
 
         /*
          * 第二步：把响应写回当前客户端。
@@ -74,7 +111,15 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
          * write：把消息写入 Netty 的发送缓冲区。
          * flush：立刻要求 Netty 尝试把缓冲区里的消息发送出去。
          */
-        context.writeAndFlush(response);
+        try {
+            context.writeAndFlush(response).addListener(
+                    ignoredFuture -> requestTracker.finishRequest()
+            );
+        } catch (RuntimeException exception) {
+            // writeAndFlush 同步失败时不会触发 Future listener，需要在这里归还计数。
+            requestTracker.finishRequest();
+            throw exception;
+        }
     }
 
     /**

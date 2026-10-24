@@ -1176,6 +1176,228 @@ Netty 编码请求或响应 / Consumer 选择 Provider
 - 当前限制是只有两种内置序列化和两种负载均衡，且没有权重、服务版本、SPI；
   下一步建议实现 Provider 优雅停机与在途请求排空。
 
+### 3.25 S5-G-A：Provider 主动摘流与 Netty 排空顺序
+
+- 日期：2026-10-24
+- 对应提交：`feat: improve RPC shutdown and deadlines`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+此前 `RpcProvider.close()` 先停止 Netty，最后通过关闭 ZooKeeper 会话让临时节点
+消失。正常停机时地址在网络服务停止后仍可能短暂可见，Consumer 有机会选到已经
+停止接收请求的 Provider；同时代码没有记录哪些服务真正发布成功，无法精确主动
+注销“发布到一半”的部分结果。
+
+#### 主要修改
+
+- `RpcProvider` 新增 `publishedServiceNames`，只在注册中心 `register()` 成功返回后
+  记录服务，区分“本地准备提供”和“已经对外发布”两个状态；
+- `publishServices()` 与 `close()` 使用同一个对象锁协调，关闭已经开始后拒绝继续
+  发布，减少启动与关闭并发时产生残留地址的风险；
+- 关闭顺序调整为“主动注销已发布地址 → 停止 Netty → 关闭注册中心会话”；
+- 任一步清理失败时仍继续执行后续清理，最后抛出第一个异常，后续异常保存为
+  suppressed exception，避免一个注销异常阻止端口和线程释放；
+- `NettyRpcServer.stop()` 的注释明确现有 `shutdownGracefully()` 会等待已经进入
+  EventLoop 的任务完成；
+- 启动顺序测试增加注销事件，并新增“注销失败仍继续停止 Netty 和关闭注册中心”
+  用例；README 同步增加完整关闭调用链和当前边界。
+
+#### 行为变化
+
+正常关闭流程变为：
+
+```text
+RpcProvider.close()
+        ↓
+ServiceRegistry.unregister(...)
+地址节点主动删除，Consumer Watch 失效缓存
+        ↓
+RpcServer.stop()
+关闭监听端口并等待 Netty worker 优雅终止
+        ↓
+ServiceRegistry.close()
+关闭会话并兜底清理临时节点
+```
+
+端口绑定失败时 `publishedServiceNames` 为空，不会伪造注销动作；如果多个服务中只有
+前几个发布成功，关闭阶段只注销这些已经成功发布的服务。
+
+#### 设计原因
+
+- 先从注册中心摘流，可以先阻止新的 Consumer 发现当前节点，再关闭网络服务；
+- 单独记录已发布集合，不能只使用本地 `serviceNames`，因为本地登记不代表远程
+  地址节点已经创建成功；
+- 主动注销用于缩短正常停机的地址可见窗口，关闭 ZooKeeper 会话仍作为进程异常、
+  主动注销失败等情况的最终兜底；
+- 本步复用 Netty 自身的优雅线程组关闭，不同时引入请求计数器和新配置，保持修改
+  容易审核。
+
+#### 验证方式与结果
+
+- `RpcProviderStartupOrderTest` 验证完整顺序为“本地登记 → 端口绑定 → 发布地址 →
+  主动注销 → 停止服务端 → 关闭注册中心”；
+- 新增注销失败场景，验证异常发生后仍会执行 Netty 停止和注册中心关闭；
+- 执行 `mvn -q -pl mini-rpc-core -Dtest=RpcProviderStartupOrderTest test`，3 个测试
+  全部通过；
+- 执行根工程 `mvn test`，core 14 个测试中 13 个通过、容器测试因 Docker 未运行
+  跳过，Starter 12 个测试全部通过，六个 Maven 模块构建成功；
+- 当前依赖 Netty `shutdownGracefully()` 排空 EventLoop 任务，还没有显式在途请求
+  计数和可配置最大排空时间；下一步建议完成这两个能力。
+
+### 3.26 S5-G-B：在途请求计数与可配置排空超时
+
+- 日期：2026-10-24
+- 对应提交：`feat: improve RPC shutdown and deadlines`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+S5-G-A 已经先从 ZooKeeper 摘流，再调用 Netty 的优雅关闭，但框架无法回答“当前
+还有多少 RPC 没结束”，也不能限制主动等待的时间。若只根据业务方法是否返回来
+判断完成，响应可能还在 Netty 写队列中，Consumer 仍然收不到结果。
+
+#### 主要修改
+
+- 新增 `InFlightRequestTracker`，以同步状态保护“是否接受新请求”和“当前在途数”，
+  避免关闭线程判断为 0 后又有请求进入的竞态；
+- `NettyRpcServerHandler` 接受请求并取得执行许可时计数 `+1`，响应
+  `ChannelFuture` 完成时计数 `-1`，覆盖业务执行和响应写入两个阶段；
+- 开始排空后，旧连接继续发来的新请求不会进入业务方法，而是收到“Provider 正在
+  关闭”的失败响应；
+- `NettyRpcServer.stop()` 先关闭监听 Channel，再等待在途数归零；超时后记录剩余
+  数量，对 worker 发起立即关闭且不再同步等待，避免关闭线程再次无限等待；
+- 新增 `mini-rpc.shutdown-timeout`，默认 10 秒，`MiniRpcProperties →
+  MiniRpcAutoConfiguration → RpcProvider → NettyRpcServer` 全链路生效；
+- 原有 `NettyRpcServer`、`RpcProvider` 构造方法继续委托默认 10 秒，保留纯 Java
+  教学入口兼容性；Provider 示例和 README 同步补充配置与行为；
+- 新增排空器单元测试，并在 Starter 属性绑定测试中验证 `12s` 配置。
+
+#### 行为变化
+
+Provider 可以配置：
+
+```yaml
+mini-rpc:
+  shutdown-timeout: 10s
+```
+
+请求与关闭线程的协作关系变为：
+
+```text
+Netty Handler 接受请求
+        ↓
+tryStartRequest()：在途数 +1
+        ↓
+执行服务方法并写出 RpcResponse
+        ↓
+ChannelFuture 完成：在途数 -1
+
+Spring 请求关闭
+        ↓
+beginDraining()：禁止新业务请求
+        ↓
+等待计数归零，最长 shutdown-timeout
+        ↓
+正常排空，或超时后继续关闭 Netty
+```
+
+#### 设计原因
+
+- 在 `tryStartRequest()` 内同时检查接收状态和增加计数，确保关闭与请求进入之间
+  没有检查后再修改的竞态窗口；
+- 在响应写入 Future 完成后才归还计数，比业务方法返回时归还更符合“Consumer 有
+  机会拿到完整结果”的定义；
+- 超时后使用零 quiet period、零 timeout 发起 Netty worker 立即关闭，并且不再
+  同步等待 graceful Future，避免 Spring 关闭线程再次无限等待；
+- 配置使用 Spring Boot `Duration`，可以明确写 `500ms`、`10s`，避免裸数字单位
+  不清楚；小于 1 毫秒的值会在创建服务端时被拒绝；
+- 任意 Java 业务代码若永久阻塞并忽略线程中断，框架不能安全强杀线程，这是当前
+  实现以及 Java 线程模型本身需要明确说明的边界。
+
+#### 验证方式与结果
+
+- `InFlightRequestTrackerTest` 验证关闭前请求可以进入、开始排空后新请求被拒绝、
+  完成响应后等待成功、超时返回 false，以及小于 1 毫秒配置被拒绝；
+- `NettyRpcServerHandlerDrainTest` 使用 Netty `EmbeddedChannel` 验证响应写完后计数
+  归零，以及排空开始后的请求不会执行 `RpcRequestHandler`；
+- `MiniRpcAutoConfigurationTest` 验证 `mini-rpc.shutdown-timeout=12s` 正确绑定为
+  `Duration.ofSeconds(12)`；
+- 执行 `mvn -pl mini-rpc-core,mini-rpc-spring-boot-starter -am test`，core 17 个
+  测试中 16 个通过、容器测试因 Docker 未运行跳过，Starter 12 个测试全部通过；
+- 增加 Handler 排空测试后执行根工程 `mvn test`，core 19 个测试中 18 个通过、
+  容器测试按设计跳过，Starter 12 个测试全部通过，六个 Maven 模块构建成功；
+- 下一步建议实现 Consumer deadline 向 Provider 传递，并让 Provider 在执行前判断
+  请求是否已经超时。
+
+### 3.27 S5-H-A：Consumer deadline 传递与 Provider 执行前检查
+
+- 日期：2026-10-24
+- 对应提交：`feat: improve RPC shutdown and deadlines`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+此前 Consumer 超时只会结束本地 `CompletableFuture` 等待。请求可能因为网络延迟
+或 Provider 排队，在 Consumer 已经放弃后才开始执行；Provider 不知道客户端期限，
+仍可能执行数据库查询、写入等已经没有返回价值的业务操作。
+
+#### 主要修改
+
+- `RpcRequest` 新增 `deadlineEpochMillis`，0 表示早期调用方没有携带 deadline；
+- `NettyRpcClient` 在服务发现和建连完成、真正发送请求之前，根据本次有效超时
+  计算绝对 deadline，因此全局 `request-timeout` 和 `@RpcReference.timeoutMillis`
+  都会自动生效；
+- 请求已有 deadline 时采用更早值，本地配置只能收紧而不能延长上游期限，为以后
+  重试和跨服务继续传播保留正确语义；deadline 加法溢出时饱和到 `Long.MAX_VALUE`；
+- `RpcRequestHandler` 在服务查找和反射调用前比较 Provider 当前时间；已经过期就
+  返回失败 `RpcResponse`，不会访问本地服务表或执行业务方法；
+- 新增 deadline 计算、Provider 过期拒绝/未过期执行，以及 JSON、JDK 序列化往返
+  测试；README 同步更新请求结构、完整调用链、限制和下一步。
+
+#### 行为变化
+
+一次使用 750ms 超时的调用现在会形成：
+
+```text
+Consumer 准备发送请求
+        ↓
+deadlineEpochMillis = 当前 Epoch 毫秒 + 750
+        ↓
+RpcRequest 通过网络到达 Provider
+        ↓
+Provider 当前时间 >= deadline？
+        ├── 是：返回失败，不执行服务方法
+        └── 否：继续服务查找和 Method.invoke(...)
+```
+
+deadline 不改变 Consumer 原来的本地等待保护：Consumer 仍然使用同一个有效超时
+等待响应；新增字段只是把这个期限告诉 Provider，减少已经失去价值的服务端执行。
+
+#### 设计原因
+
+- deadline 在 Netty 真正发送前计算，与现有“请求发出后等待响应”的超时语义一致，
+  不把首次 ZooKeeper 查询和 TCP 建连时间计算进去；
+- 使用绝对时间后，Provider 无需知道 Consumer 何时发出，只需比较当前时间；代价
+  是双方系统时钟必须基本同步，生产环境通常需要可靠的时间同步服务；
+- Provider 在取得服务对象之前检查，确保过期请求不会触发业务副作用；
+- 0 作为“没有 deadline”保留早期手工构造请求和 Socket 教学代码的兼容行为；
+- 本步只处理“开始执行前已经过期”，不尝试强制终止任意正在运行的 Java 方法，
+  将协作式取消留给下一阶段。
+
+#### 验证方式与结果
+
+- `NettyRpcClientDeadlineTest` 验证默认设置、保留更早期限、收紧更晚期限和加法溢出；
+- `RpcRequestHandlerDeadlineTest` 验证过期请求不访问 `ServiceProvider`，未过期请求
+  仍能正常反射执行；
+- `RpcRequestDeadlineSerializationTest` 验证 JSON、JDK 两种正文格式都能完整保留
+  `deadlineEpochMillis`；
+- 执行 deadline 相关定向测试，8 个测试全部通过；
+- 执行根工程 `mvn test`，core 27 个测试中 26 个通过、容器测试因 Docker 未运行
+  跳过，Starter 12 个测试全部通过，六个 Maven 模块构建成功；
+- 当前限制是绝对 deadline 依赖两端时钟同步，并且无法取消已经开始执行的服务方法；
+  下一步建议设计 Provider 执行中的协作式取消。
+
 ---
 
 ## 4. 接下来如何接入 Spring
@@ -1226,14 +1448,14 @@ Netty 编码请求或响应 / Consumer 选择 Provider
 ### S5：补齐适合 starter 的可配置和扩展能力
 
 - 状态：进行中，S5-A 全局请求超时、S5-B 缓存与 Watch、S5-C Provider 安全
-  发布顺序、S5-D 容器端到端测试和 S5-E 单引用超时已完成，详细记录见
-  3.18～3.23；
+  发布顺序、S5-D 容器端到端测试、S5-E 单引用超时、S5-F 策略配置、S5-G
+  优雅停机以及 S5-H-A deadline 执行前检查已完成，详细记录见 3.18～3.27；
 - 服务发现已有短期本地缓存和 ZooKeeper Watch；
 - Provider 已改为 Netty 端口绑定成功后再发布 ZooKeeper 地址；
 - 已使用 Testcontainers 自动验证真实 ZooKeeper + Netty 完整链路；
 - 全局和单引用请求超时已接入；序列化器和负载均衡策略已支持 Starter 配置；
 - 条件装配和清晰的启动失败提示；
-- 重试、心跳、优雅停机与更完整的自动化测试；
+- 执行中取消、重试、心跳与更完整的自动化测试；
 - 视学习进度再引入 SPI，不在 Spring 基础链路之前堆叠过多功能。
 
 ---

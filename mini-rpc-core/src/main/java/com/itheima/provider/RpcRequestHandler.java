@@ -49,6 +49,25 @@ public class RpcRequestHandler {
 
         long requestId = request.getRequestId();
 
+        long deadlineEpochMillis = request.getDeadlineEpochMillis();
+        long currentEpochMillis = System.currentTimeMillis();
+        if (deadlineEpochMillis > 0
+                && currentEpochMillis >= deadlineEpochMillis) {
+            /*
+             * Consumer 已经没有必要继续等待这次调用。这里必须放在服务查找和反射
+             * 执行之前，确保过期请求不会产生数据库写入等业务副作用。
+             */
+            return RpcResponse.failure(
+                    requestId,
+                    new RpcException(
+                            "RPC 请求在 Provider 执行前已超过 deadline，requestId："
+                                    + requestId
+                                    + "，deadline：" + deadlineEpochMillis
+                                    + "，当前时间：" + currentEpochMillis
+                    )
+            );
+        }
+
         try {
             // 第一步：根据接口全限定名找到真正的服务实现对象。
             Object service = serviceProvider.getService(request.getInterfaceName());

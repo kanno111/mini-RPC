@@ -17,6 +17,9 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
 /**
  * 基于 Netty 的 RPC 服务端。
  *
@@ -38,6 +41,10 @@ public class NettyRpcServer implements RpcServer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NettyRpcServer.class);
 
+    /** Provider 默认最多等待 10 秒，让关闭前已经开始的请求完成响应。 */
+    public static final Duration DEFAULT_SHUTDOWN_TIMEOUT =
+            Duration.ofSeconds(10);
+
     /** 服务端要监听的端口。 */
     private final int port;
 
@@ -46,6 +53,12 @@ public class NettyRpcServer implements RpcServer {
 
     /** 可以被所有客户端连接共享的服务端业务处理器。 */
     private final NettyRpcServerHandler serverHandler;
+
+    /** 关闭时等待在途请求完成的最长时间。 */
+    private final Duration shutdownTimeout;
+
+    /** 服务端和业务 Handler 共享的在途请求计数器。 */
+    private final InFlightRequestTracker requestTracker;
 
     /**
      * boss 线程组只负责接受新连接，不执行具体请求。
@@ -77,6 +90,25 @@ public class NettyRpcServer implements RpcServer {
             Serializer serializer,
             RpcRequestHandler requestHandler
     ) {
+        this(
+                port,
+                serializer,
+                requestHandler,
+                DEFAULT_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    /**
+     * 创建带有明确排空超时的 Netty RPC 服务端。
+     *
+     * @param shutdownTimeout 关闭时等待在途请求完成的最长时间
+     */
+    public NettyRpcServer(
+            int port,
+            Serializer serializer,
+            RpcRequestHandler requestHandler,
+            Duration shutdownTimeout
+    ) {
         if (port < 1 || port > 65535) {
             throw new RpcException("RPC 服务端端口必须在 1 到 65535 之间：" + port);
         }
@@ -86,10 +118,16 @@ public class NettyRpcServer implements RpcServer {
         if (requestHandler == null) {
             throw new RpcException("RpcRequestHandler 不能为空");
         }
+        validateShutdownTimeout(shutdownTimeout);
 
         this.port = port;
         this.serializer = serializer;
-        this.serverHandler = new NettyRpcServerHandler(requestHandler);
+        this.shutdownTimeout = shutdownTimeout;
+        this.requestTracker = new InFlightRequestTracker();
+        this.serverHandler = new NettyRpcServerHandler(
+                requestHandler,
+                requestTracker
+        );
     }
 
     /**
@@ -216,7 +254,9 @@ public class NettyRpcServer implements RpcServer {
      * 停止监听，并优雅关闭 boss、worker 线程组。
      *
      * <p>方法允许重复调用。关闭监听 Channel 后，阻塞在 start() 中的
-     * {@code closeFuture().sync()} 会被唤醒。</p>
+     * {@code closeFuture().sync()} 会被唤醒。workerGroup 使用 Netty 的
+     * {@code shutdownGracefully()}：已经进入 EventLoop 的请求任务可以先执行完，
+     * 当前线程会等待线程组真正终止后再返回。</p>
      */
     @Override
     public void stop() {
@@ -238,16 +278,63 @@ public class NettyRpcServer implements RpcServer {
             workerToShutdown = workerGroup;
         }
 
+        int requestsToDrain = requestTracker.beginDraining();
         if (channelToClose != null) {
             channelToClose.close().syncUninterruptibly();
         }
+
+        boolean drained = requestTracker.awaitCompletion(shutdownTimeout);
+        if (requestsToDrain > 0 && drained) {
+            LOGGER.info(
+                    "Netty RPC 服务端已完成在途请求排空，数量：{}",
+                    requestsToDrain
+            );
+        } else if (!drained) {
+            LOGGER.warn(
+                    "等待在途 RPC 请求完成已超时，将继续关闭，剩余数量：{}，超时：{}ms",
+                    requestTracker.getInFlightRequestCount(),
+                    shutdownTimeout.toMillis()
+            );
+        }
+
+        long shutdownTimeoutMillis = shutdownTimeout.toMillis();
         if (bossToShutdown != null) {
-            bossToShutdown.shutdownGracefully().syncUninterruptibly();
+            bossToShutdown.shutdownGracefully(
+                    0,
+                    shutdownTimeoutMillis,
+                    TimeUnit.MILLISECONDS
+            ).syncUninterruptibly();
         }
         if (workerToShutdown != null) {
-            workerToShutdown.shutdownGracefully().syncUninterruptibly();
+            if (drained) {
+                workerToShutdown.shutdownGracefully(
+                        0,
+                        shutdownTimeoutMillis,
+                        TimeUnit.MILLISECONDS
+                ).syncUninterruptibly();
+            } else {
+                /*
+                 * 若业务方法在排空期限内仍未结束，继续同步等待 graceful Future
+                 * 可能让 Spring 关闭线程无限阻塞。这里把 Netty 的 quiet period 和
+                 * timeout 都设为 0，发起立即关闭且不再同步等待 Future。业务代码若
+                 * 永久阻塞，Java 仍无法安全强杀它，但框架的 close() 会继续返回。
+                 */
+                workerToShutdown.shutdownGracefully(
+                        0,
+                        0,
+                        TimeUnit.MILLISECONDS
+                );
+            }
         }
 
         LOGGER.info("Netty RPC 服务端已停止，端口：{}", port);
+    }
+
+    /** 在创建线程和绑定端口前尽早拒绝无效配置。 */
+    private void validateShutdownTimeout(Duration timeout) {
+        if (timeout == null || timeout.isNegative() || timeout.isZero()
+                || timeout.toMillis() < 1) {
+            throw new RpcException("Provider 排空超时不能小于 1 毫秒");
+        }
     }
 }

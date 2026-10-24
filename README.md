@@ -58,6 +58,9 @@ JDK 动态代理
 | S5-D | Testcontainers 真实 ZooKeeper + Netty 端到端测试 | 已完成 |
 | S5-E | `@RpcReference` 单引用超时覆盖全局配置 | 已完成 |
 | S5-F | 序列化器和负载均衡策略 Starter 配置化 | 已完成 |
+| S5-G-A | Provider 主动摘流与 Netty 排空顺序 | 已完成 |
+| S5-G-B | 在途请求计数与可配置排空超时 | 已完成 |
+| S5-H-A | Consumer deadline 传递与 Provider 执行前检查 | 已完成 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -165,6 +168,7 @@ mini-rpc:
   enabled: true
   registry-address: 127.0.0.1:2181
   request-timeout: 5s
+  shutdown-timeout: 10s
   serializer: json
   load-balance: round-robin
   provider-enabled: false
@@ -183,6 +187,17 @@ private HelloService helloService;
 
 没有填写 `timeoutMillis` 时继续使用全局配置。覆盖值只改变这个代理每次调用等待
 响应的时间；不同代理仍然共享同一个 Netty 客户端、Channel 和 ZooKeeper 连接。
+
+Netty 客户端真正发送请求前，还会把本次最终采用的超时换算成绝对 deadline，并
+写入 `RpcRequest.deadlineEpochMillis`。Provider 会在查找服务和反射调用之前检查
+该值；请求如果已经过期，就直接返回失败，不执行对应业务方法。已有更早 deadline
+时只会保留或收紧，不会因为下游超时更长而延长上游期限。
+
+`shutdown-timeout` 只用于 Provider 关闭，默认 10 秒。Provider 摘流后不再让新请求
+进入业务方法，并在这段时间内等待已经开始的请求完成响应写入；超时后记录剩余
+请求数、发起 Netty worker 的立即关闭并继续返回。它和 Consumer 的
+`request-timeout` 是两个不同方向的时间限制，前者管理服务关闭，后者管理客户端
+等待响应。
 
 `serializer` 决定本应用发送 RPC 正文时使用的编码方式，可选 `json`（默认）或
 `jdk`。Consumer 用它编码请求，Provider 用它编码响应；接收方根据 20 字节协议头
@@ -266,7 +281,7 @@ public class HelloServiceImpl implements HelloService {
 | 类 | 作用 |
 |---|---|
 | `RpcProtocol` | 保存魔数、版本、消息类型、序列化类型、状态和协议头长度 |
-| `RpcRequest` | 描述客户端想调用的接口、方法、参数和请求编号 |
+| `RpcRequest` | 描述接口、方法、参数、请求编号、版本和 deadline |
 | `RpcResponse` | 描述服务端返回的数据或异常信息 |
 | `RpcException` | 框架统一使用的运行时异常 |
 
@@ -281,7 +296,8 @@ RpcRequest
 ├── methodName      sayHello
 ├── parameterTypes  [java.lang.String]
 ├── parameters      ["Tom"]
-└── version          当前预留，尚未参与路由
+├── version          当前预留，尚未参与路由
+└── deadlineEpochMillis  Consumer 等待响应的绝对截止时间
 ```
 
 ### 4.3 serialize：序列化
@@ -582,6 +598,36 @@ HelloService 全限定名 → 127.0.0.1:8080
 第 3 步必须先于第 4 步。如果端口被其他程序占用，Netty 绑定失败，启动成功
 回调不会执行，ZooKeeper 中也就不会出现这个无法连接的 Provider 地址。
 
+正常关闭时采用与启动相反的安全顺序：
+
+```text
+SpringRpcProviderLifecycle.stop()
+               ↓
+RpcProvider.close()
+               ↓
+主动注销实际已经发布的 ZooKeeper 地址
+Consumer Watch 尽快失效旧缓存
+               ↓
+InFlightRequestTracker 停止接受新业务请求
+旧连接上的新请求返回 Provider 正在关闭
+               ↓
+关闭 Netty 监听端口
+不再接受新连接
+               ↓
+等待在途请求计数归零
+响应写入完成后计数 -1
+最多等待 shutdown-timeout
+               ↓
+Netty worker shutdownGracefully()
+               ↓
+关闭 ZooKeeper 会话
+兜底删除当前会话的临时节点
+```
+
+只有成功发布过的服务才会主动注销。端口绑定失败时不会执行无意义的注销；多个
+服务发布到一半失败时，前面已经成功发布的地址仍能在清理阶段被删除。即使注销、
+Netty 停止或注册中心关闭中的某一步失败，后续清理动作也会继续执行。
+
 `@RpcService` 自己不会完成以上动作，它只是一个“标记”。Starter、Spring 容器、
 `RpcProvider`、ZooKeeper 和 Netty 共同完成后面的工作。
 
@@ -613,32 +659,37 @@ String result = helloService.sayHello("world");
                       ↓
 7. NettyRpcClient 建立或复用目标 Channel
                       ↓
-8. PendingRequestManager 保存
+8. 根据本次有效超时计算 deadlineEpochMillis
+                      ↓
+9. PendingRequestManager 保存
    requestId → CompletableFuture<RpcResponse>
                       ↓
-9. RpcEncoder 编码为“20 字节协议头 + JSON 正文”
+10. RpcEncoder 编码为“20 字节协议头 + 配置的序列化正文”
                       ↓
-10. 网络发送到 Provider
+11. 网络发送到 Provider
                       ↓
-11. 服务端 RpcDecoder 解码成 RpcRequest
+12. 服务端 RpcDecoder 解码成 RpcRequest
                       ↓
-12. NettyRpcServerHandler 把请求交给 RpcRequestHandler
+13. NettyRpcServerHandler 把请求交给 RpcRequestHandler
                       ↓
-13. DefaultServiceProvider 根据接口名找到 HelloServiceImpl 对象
+14. RpcRequestHandler 检查 deadline
+    已过期：直接返回失败，不执行服务方法
+                      ↓ 未过期
+15. DefaultServiceProvider 根据接口名找到 HelloServiceImpl 对象
                       ↓
-14. RpcRequestHandler 根据方法名和参数类型找到 Method
+16. RpcRequestHandler 根据方法名和参数类型找到 Method
                       ↓
-15. Method.invoke 执行 HelloServiceImpl.sayHello("world")
+17. Method.invoke 执行 HelloServiceImpl.sayHello("world")
                       ↓
-16. 返回值包装成带有相同 requestId 的 RpcResponse
+18. 返回值包装成带有相同 requestId 的 RpcResponse
                       ↓
-17. RpcEncoder 编码响应并通过网络返回
+19. RpcEncoder 编码响应并通过网络返回
                       ↓
-18. 客户端 RpcDecoder 得到 RpcResponse
+20. 客户端 RpcDecoder 得到 RpcResponse
                       ↓
-19. NettyRpcClientHandler 根据 requestId 完成对应 future
+21. NettyRpcClientHandler 根据 requestId 完成对应 future
                       ↓
-20. RpcClientProxy 取出 data，作为 sayHello 的返回值
+22. RpcClientProxy 取出 data，作为 sayHello 的返回值
 ```
 
 ### requestId 为什么重要
@@ -857,8 +908,12 @@ mini-rpc-example-consumer
    SPI、权重、最少活跃或一致性哈希等扩展；
 6. 容器端到端测试需要本机或 CI 提供可用的 Docker 引擎；没有 Docker 时该用例
    会跳过，但不影响其余单元测试；
-7. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
-8. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
+7. Provider 已支持在途请求计数和排空超时，但任意 Java 业务代码如果永久阻塞且
+   忽略线程中断，框架无法安全地强制终止这段用户代码；
+8. deadline 使用 Consumer 的绝对 Epoch 毫秒，要求 Consumer 与 Provider 系统时钟
+   基本同步；当前只拒绝执行前已经过期的请求，尚不能取消正在执行的业务方法；
+9. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
+10. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
 ---
 
@@ -866,8 +921,8 @@ mini-rpc-example-consumer
 
 Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 实现 Provider 优雅停机：先停止接收和发布新流量，再等待正在执行的请求完成；
-2. 再逐步加入 deadline 传递、心跳、有限重试、SPI 和更多策略配置。
+1. 设计 Provider 执行中的协作式取消，让可中断业务在 deadline 到达后尽快停止；
+2. 再逐步加入心跳、有限重试、SPI 和更多策略配置。
 
 更细的 Spring 分步计划参见
 [DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。

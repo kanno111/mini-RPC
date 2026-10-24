@@ -71,4 +71,16 @@ public class RpcRequest implements Serializable {
      * <p>M0 阶段只保存该信息，真正按版本选择服务会在后续阶段实现。</p>
      */
     private String version;
+
+    /**
+     * 本次调用的绝对截止时间，使用 Unix Epoch 毫秒。
+     *
+     * <p>Consumer 在真正发送请求前，根据本次有效的 request-timeout 计算该值。
+     * Provider 收到请求后如果发现当前时间已经达到或超过 deadline，就直接返回
+     * 超时响应，不再执行已经失去价值的业务方法。</p>
+     *
+     * <p>值为 0 表示旧调用方没有提供 deadline，用于兼容早期教学入口。绝对时间
+     * 依赖 Consumer 和 Provider 的系统时钟基本同步，这是当前学习实现的限制。</p>
+     */
+    private long deadlineEpochMillis;
 }

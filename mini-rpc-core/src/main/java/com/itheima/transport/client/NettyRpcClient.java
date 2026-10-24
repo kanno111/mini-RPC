@@ -438,6 +438,18 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
         long requestId = request.getRequestId();
 
         /*
+         * 此时服务发现和建连已经完成，接下来才真正发送请求并开始等待响应。
+         * 因此 deadline 与当前 request-timeout 的原有语义一致，不把首次建连时间
+         * 计算在响应等待窗口中。已有更早 deadline 时只收紧、不延长，给以后重试
+         * 或上游 deadline 继续向下传播保留正确语义。
+         */
+        applyDeadline(
+                request,
+                effectiveTimeoutMillis,
+                System.currentTimeMillis()
+        );
+
+        /*
          * 必须先登记 Future，再发送请求。
          * 如果先发送，响应速度非常快时，客户端 Handler 可能已经收到响应，
          * 但 Map 中还没有 Future，导致响应无法匹配。
@@ -501,6 +513,35 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
                     "等待 RPC 响应失败，requestId：" + requestId,
                     cause
             );
+        }
+    }
+
+    /**
+     * 把本次有效超时转换成绝对 deadline，并保留请求中已经存在的更早期限。
+     *
+     * <p>方法保持包可见，便于单元测试使用固定时间验证计算，不需要真的建立
+     * Netty 连接。加法溢出时使用 {@link Long#MAX_VALUE}，表示一个极远的期限。</p>
+     */
+    static void applyDeadline(
+            RpcRequest request,
+            long effectiveTimeoutMillis,
+            long currentEpochMillis
+    ) {
+        if (request == null) {
+            throw new RpcException("RpcRequest 不能为空");
+        }
+        if (effectiveTimeoutMillis <= 0) {
+            throw new RpcException("RPC 请求超时时间不能小于 1 毫秒");
+        }
+
+        long candidateDeadline = currentEpochMillis
+                > Long.MAX_VALUE - effectiveTimeoutMillis
+                ? Long.MAX_VALUE
+                : currentEpochMillis + effectiveTimeoutMillis;
+        long existingDeadline = request.getDeadlineEpochMillis();
+
+        if (existingDeadline <= 0 || candidateDeadline < existingDeadline) {
+            request.setDeadlineEpochMillis(candidateDeadline);
         }
     }
 

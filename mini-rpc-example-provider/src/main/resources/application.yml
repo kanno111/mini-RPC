@@ -10,4 +10,6 @@ mini-rpc:
   registry-address: 127.0.0.1:2181
   server-host: 127.0.0.1
   server-port: 8080
+  # Spring 关闭时最多等待 10 秒，让已经开始的 RPC 请求完成响应。
+  shutdown-timeout: 10s
   load-balance: round_robin

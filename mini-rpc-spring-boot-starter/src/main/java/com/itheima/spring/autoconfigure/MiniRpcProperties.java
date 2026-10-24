@@ -14,6 +14,9 @@ import java.time.Duration;
  *   enabled: true
  *   registry-address: 127.0.0.1:2181
  *   request-timeout: 5s
+ *   shutdown-timeout: 10s
+ *   serializer: json
+ *   load-balance: round-robin
  *   provider-enabled: false
  *   server-host: 127.0.0.1
  *   server-port: 8080
@@ -22,8 +25,8 @@ import java.time.Duration;
  * <p>自动绑定到本类的各个字段。这里的“绑定”可以简单理解为：Spring 读取
  * 配置文件，然后调用对应的 setter 把值写入 Java 对象。</p>
  *
- * <p>目前注册中心地址、请求超时、Provider 开关、主机和端口都已经接入
- * 自动配置。</p>
+ * <p>目前注册中心地址、请求超时、关闭排空超时、策略选择、Provider 开关、
+ * 主机和端口都已经接入自动配置。</p>
  */
 @ConfigurationProperties(prefix = "mini-rpc")
 public class MiniRpcProperties {
@@ -36,6 +39,9 @@ public class MiniRpcProperties {
 
     /** Consumer 等待一次 RPC 响应的最长时间。 */
     private Duration requestTimeout = Duration.ofSeconds(5);
+
+    /** Provider 关闭时等待在途请求完成的最长时间。 */
+    private Duration shutdownTimeout = Duration.ofSeconds(10);
 
     /** 本端发送 RPC 正文时使用的序列化方式，默认继续使用 JSON。 */
     private SerializerType serializer = SerializerType.JSON;
@@ -74,6 +80,14 @@ public class MiniRpcProperties {
 
     public void setRequestTimeout(Duration requestTimeout) {
         this.requestTimeout = requestTimeout;
+    }
+
+    public Duration getShutdownTimeout() {
+        return shutdownTimeout;
+    }
+
+    public void setShutdownTimeout(Duration shutdownTimeout) {
+        this.shutdownTimeout = shutdownTimeout;
     }
 
     public SerializerType getSerializer() {

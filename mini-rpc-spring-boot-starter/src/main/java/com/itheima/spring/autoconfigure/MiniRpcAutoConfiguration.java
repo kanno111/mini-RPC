@@ -172,7 +172,8 @@ public class MiniRpcAutoConfiguration {
                 properties.getServerHost(),
                 properties.getServerPort(),
                 properties.getRegistryAddress(),
-                serializer
+                serializer,
+                properties.getShutdownTimeout()
         );
     }
 
