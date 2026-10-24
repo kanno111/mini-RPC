@@ -4,5 +4,9 @@ spring:
 
 mini-rpc:
   enabled: true
+  # 可选 json / jdk；正式场景不建议反序列化来源不可信的 JDK 对象流。
+  serializer: json
+  # 多个 Provider 可选 round-robin / random。
+  load-balance: round-robin
   registry-address: 127.0.0.1:2181
   request-timeout: 5s

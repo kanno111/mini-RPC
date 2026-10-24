@@ -2,8 +2,13 @@ package com.itheima.spring.autoconfigure;
 
 import com.itheima.annotation.RpcReference;
 import com.itheima.client.RpcClientFactory;
+import com.itheima.loadbalance.LoadBalance;
+import com.itheima.loadbalance.RandomLoadBalance;
+import com.itheima.loadbalance.RoundRobinLoadBalance;
 import com.itheima.registry.ServiceAddress;
+import com.itheima.serialize.JdkSerializer;
 import com.itheima.serialize.JsonSerializer;
+import com.itheima.serialize.Serializer;
 import com.itheima.transport.client.NettyRpcClient;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
@@ -48,6 +53,8 @@ class MiniRpcAutoConfigurationTest {
                 .withPropertyValues(
                         "mini-rpc.registry-address=192.168.1.10:2181",
                         "mini-rpc.request-timeout=8s",
+                        "mini-rpc.serializer=jdk",
+                        "mini-rpc.load-balance=random",
                         "mini-rpc.server-port=9090"
                 )
                 .run(context -> {
@@ -61,8 +68,74 @@ class MiniRpcAutoConfigurationTest {
                             .isEqualTo("192.168.1.10:2181");
                     assertThat(properties.getRequestTimeout())
                             .isEqualTo(Duration.ofSeconds(8));
+                    assertThat(properties.getSerializer())
+                            .isEqualTo(
+                                    MiniRpcProperties.SerializerType.JDK
+                            );
+                    assertThat(properties.getLoadBalance())
+                            .isEqualTo(
+                                    MiniRpcProperties.LoadBalanceType.RANDOM
+                            );
                     assertThat(properties.getServerPort())
                             .isEqualTo(9090);
+                });
+    }
+
+    @Test
+    void shouldCreateDefaultSerializerAndLoadBalance() {
+        contextRunner.run(context -> {
+            assertThat(context).hasSingleBean(Serializer.class);
+            assertThat(context.getBean(Serializer.class))
+                    .isInstanceOf(JsonSerializer.class);
+
+            assertThat(context).hasSingleBean(LoadBalance.class);
+            assertThat(context.getBean(LoadBalance.class))
+                    .isInstanceOf(RoundRobinLoadBalance.class);
+        });
+    }
+
+    @Test
+    void shouldCreateConfiguredSerializerAndLoadBalance() {
+        contextRunner
+                .withPropertyValues(
+                        "mini-rpc.serializer=jdk",
+                        "mini-rpc.load-balance=random"
+                )
+                .run(context -> {
+                    assertThat(context.getBean(Serializer.class))
+                            .isInstanceOf(JdkSerializer.class);
+                    assertThat(context.getBean(LoadBalance.class))
+                            .isInstanceOf(RandomLoadBalance.class);
+                });
+    }
+
+    @Test
+    void shouldBindKebabCaseRoundRobinNameUsedByYaml() {
+        contextRunner
+                .withPropertyValues("mini-rpc.load-balance=round-robin")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(LoadBalance.class))
+                            .isInstanceOf(RoundRobinLoadBalance.class);
+                });
+    }
+
+    @Test
+    void shouldUseApplicationProvidedStrategyBeans() {
+        Serializer customSerializer = new JsonSerializer();
+        LoadBalance customLoadBalance = (serviceName, addresses) ->
+                addresses.getFirst();
+
+        contextRunner
+                .withBean(Serializer.class, () -> customSerializer)
+                .withBean(LoadBalance.class, () -> customLoadBalance)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(Serializer.class);
+                    assertThat(context.getBean(Serializer.class))
+                            .isSameAs(customSerializer);
+                    assertThat(context).hasSingleBean(LoadBalance.class);
+                    assertThat(context.getBean(LoadBalance.class))
+                            .isSameAs(customLoadBalance);
                 });
     }
 

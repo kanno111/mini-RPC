@@ -1095,6 +1095,87 @@ RpcClientProxy 每次调用传递所选超时
 - 当前限制是注解只覆盖请求等待时间，不覆盖 TCP 连接超时；下一步建议让序列化器
   和负载均衡策略可以通过 Starter 配置切换。
 
+### 3.24 S5-F：序列化器和负载均衡策略 Starter 配置化
+
+- 日期：2026-10-24
+- 对应提交：`feat: configure RPC strategies`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+Starter 虽然已经自动组装完整调用链，但 `RpcClientFactory` 固定创建
+`JsonSerializer + RoundRobinLoadBalance`，`RpcProvider` 也固定创建
+`JsonSerializer`。框架已经有对应接口，却还不能通过 Spring Boot 配置选择已有
+实现；业务方若要改变策略，只能重新手工组装高层入口。
+
+#### 主要修改
+
+- `MiniRpcProperties` 新增 `serializer` 和 `load-balance`：序列化可选 `json/jdk`，
+  负载均衡可选 `round-robin/random`，默认值保持 JSON 与轮询不变；
+- core 新增无共享状态的 `RandomLoadBalance`，使用 `ThreadLocalRandom` 从候选
+  Provider 中等概率选址；
+- `RpcClientFactory` 新增接收 `Serializer`、`LoadBalance` 的构造方法，原构造方法
+  继续委托默认 JSON 与轮询，保留非 Spring 教学入口的兼容性；
+- `RpcProvider` 新增接收 `Serializer` 的构造方法，Starter 选中的序列化方式因此
+  同时接入 Consumer 请求编码和 Provider 响应编码；
+- 自动配置新增 `Serializer`、`LoadBalance` Bean，并使用
+  `@ConditionalOnMissingBean` 允许业务应用提供兼容的自定义 Bean；
+- Provider、Consumer 示例配置和 README 同步补充新选项、默认值与安全限制；
+- 新增随机策略测试，以及默认选择、配置切换和自定义 Bean 让位测试。
+
+#### 行为变化
+
+默认配置不变，下面两个属性即使省略也仍使用 JSON 与轮询：
+
+```yaml
+mini-rpc:
+  serializer: json
+  load-balance: round-robin
+```
+
+Consumer 可以改为 JDK 请求编码和随机选址：
+
+```yaml
+mini-rpc:
+  serializer: jdk
+  load-balance: random
+```
+
+调用链中的固定实现变为配置选择：
+
+```text
+MiniRpcProperties
+        ↓
+Serializer Bean + LoadBalance Bean
+        ↓
+RpcClientFactory / RpcProvider
+        ↓
+Netty 编码请求或响应 / Consumer 选择 Provider
+```
+
+#### 设计原因
+
+- 配置枚举只暴露框架已经实现并能解码的选项，拼写错误会在 Spring 配置绑定阶段
+  直接失败，避免运行到第一次 RPC 调用才发现配置无效；
+- 选择发生在 Starter，core 继续只依赖抽象接口，保持 core 不依赖 Spring；
+- Consumer 和 Provider 共用同一个 `Serializer` Bean，但它们只用它编码本端发出
+  的正文；接收方仍根据协议头的序列化编号选择内置解码器；
+- 保留原构造方法和默认值，已有纯 Java 示例与未填写新配置的应用行为不变；
+- Spring Bean 覆盖为以后扩展保留入口，但当前解码器只支持 JDK、JSON 类型，尚未
+  建立可以动态注册任意序列化编号的完整 SPI。
+
+#### 验证方式与结果
+
+- `RandomLoadBalanceTest` 验证单候选地址选择和空列表校验，测试不依赖随机概率；
+- `MiniRpcAutoConfigurationTest` 验证枚举属性绑定、YAML 中的 `round-robin` 写法、
+  默认 JSON + 轮询、切换为 JDK + 随机，以及业务自定义 Bean 覆盖内置 Bean；
+- 执行 `mvn -pl mini-rpc-core,mini-rpc-spring-boot-starter -am test`，core 13 个
+  测试中 12 个通过、容器测试因 Docker 未运行跳过，Starter 12 个测试全部通过，
+  0 失败、0 错误；
+- 执行根工程 `mvn test`，六个 Maven 模块全部构建成功，两个示例应用也完成编译；
+- 当前限制是只有两种内置序列化和两种负载均衡，且没有权重、服务版本、SPI；
+  下一步建议实现 Provider 优雅停机与在途请求排空。
+
 ---
 
 ## 4. 接下来如何接入 Spring
@@ -1150,7 +1231,7 @@ RpcClientProxy 每次调用传递所选超时
 - 服务发现已有短期本地缓存和 ZooKeeper Watch；
 - Provider 已改为 Netty 端口绑定成功后再发布 ZooKeeper 地址；
 - 已使用 Testcontainers 自动验证真实 ZooKeeper + Netty 完整链路；
-- 全局和单引用请求超时已接入；序列化器和负载均衡策略仍待配置化；
+- 全局和单引用请求超时已接入；序列化器和负载均衡策略已支持 Starter 配置；
 - 条件装配和清晰的启动失败提示；
 - 重试、心跳、优雅停机与更完整的自动化测试；
 - 视学习进度再引入 SPI，不在 Spring 基础链路之前堆叠过多功能。

@@ -1,6 +1,12 @@
 package com.itheima.spring.autoconfigure;
 
 import com.itheima.client.RpcClientFactory;
+import com.itheima.loadbalance.LoadBalance;
+import com.itheima.loadbalance.RandomLoadBalance;
+import com.itheima.loadbalance.RoundRobinLoadBalance;
+import com.itheima.serialize.JdkSerializer;
+import com.itheima.serialize.JsonSerializer;
+import com.itheima.serialize.Serializer;
 import com.itheima.server.RpcProvider;
 import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.ListableBeanFactory;
@@ -42,6 +48,38 @@ import org.springframework.context.annotation.Lazy;
         matchIfMissing = true
 )
 public class MiniRpcAutoConfiguration {
+
+    /**
+     * 根据配置创建正文序列化器。
+     *
+     * <p>Consumer 编码请求、Provider 编码响应时都会复用这个 Bean。业务应用如果
+     * 自己声明了 {@link Serializer} Bean，{@code ConditionalOnMissingBean} 会让
+     * 默认实现退出，为以后接入自定义序列化器保留标准 Spring 扩展入口。</p>
+     */
+    @Bean
+    @ConditionalOnMissingBean(Serializer.class)
+    public Serializer rpcSerializer(MiniRpcProperties properties) {
+        return switch (properties.getSerializer()) {
+            case JSON -> new JsonSerializer();
+            case JDK -> new JdkSerializer();
+        };
+    }
+
+    /**
+     * 根据配置创建 Consumer 使用的负载均衡器。
+     *
+     * <p>Provider 应用本身不需要选择地址，但创建这个轻量、无外部连接的 Bean
+     * 不会启动客户端或访问 ZooKeeper，也能让 Provider/Consumer 共享同一套自动
+     * 配置。业务应用声明自己的 {@link LoadBalance} Bean 时同样可以覆盖默认值。</p>
+     */
+    @Bean
+    @ConditionalOnMissingBean(LoadBalance.class)
+    public LoadBalance rpcLoadBalance(MiniRpcProperties properties) {
+        return switch (properties.getLoadBalance()) {
+            case ROUND_ROBIN -> new RoundRobinLoadBalance();
+            case RANDOM -> new RandomLoadBalance();
+        };
+    }
 
     /**
      * 扫描 Spring Boot 启动类所在包，把 @RpcService 类登记成 Spring Bean。
@@ -106,11 +144,15 @@ public class MiniRpcAutoConfiguration {
     @Lazy
     @ConditionalOnMissingBean(RpcClientFactory.class)
     public RpcClientFactory rpcClientFactory(
-            MiniRpcProperties properties
+            MiniRpcProperties properties,
+            Serializer serializer,
+            LoadBalance loadBalance
     ) {
         return new RpcClientFactory(
                 properties.getRegistryAddress(),
-                properties.getRequestTimeout()
+                properties.getRequestTimeout(),
+                serializer,
+                loadBalance
         );
     }
 
@@ -122,11 +164,15 @@ public class MiniRpcAutoConfiguration {
             havingValue = "true"
     )
     @ConditionalOnMissingBean(RpcProvider.class)
-    public RpcProvider rpcProvider(MiniRpcProperties properties) {
+    public RpcProvider rpcProvider(
+            MiniRpcProperties properties,
+            Serializer serializer
+    ) {
         return new RpcProvider(
                 properties.getServerHost(),
                 properties.getServerPort(),
-                properties.getRegistryAddress()
+                properties.getRegistryAddress(),
+                serializer
         );
     }
 

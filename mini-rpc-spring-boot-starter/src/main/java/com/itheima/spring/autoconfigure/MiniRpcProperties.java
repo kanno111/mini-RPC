@@ -37,6 +37,12 @@ public class MiniRpcProperties {
     /** Consumer 等待一次 RPC 响应的最长时间。 */
     private Duration requestTimeout = Duration.ofSeconds(5);
 
+    /** 本端发送 RPC 正文时使用的序列化方式，默认继续使用 JSON。 */
+    private SerializerType serializer = SerializerType.JSON;
+
+    /** Consumer 从多个 Provider 中选择地址的策略，默认继续使用轮询。 */
+    private LoadBalanceType loadBalance = LoadBalanceType.ROUND_ROBIN;
+
     /** 是否把当前 Spring Boot 应用作为 RPC Provider 启动。 */
     private boolean providerEnabled;
 
@@ -70,6 +76,22 @@ public class MiniRpcProperties {
         this.requestTimeout = requestTimeout;
     }
 
+    public SerializerType getSerializer() {
+        return serializer;
+    }
+
+    public void setSerializer(SerializerType serializer) {
+        this.serializer = serializer;
+    }
+
+    public LoadBalanceType getLoadBalance() {
+        return loadBalance;
+    }
+
+    public void setLoadBalance(LoadBalanceType loadBalance) {
+        this.loadBalance = loadBalance;
+    }
+
     public boolean isProviderEnabled() {
         return providerEnabled;
     }
@@ -92,5 +114,21 @@ public class MiniRpcProperties {
 
     public void setServerPort(int serverPort) {
         this.serverPort = serverPort;
+    }
+
+    /** Starter 当前内置的序列化器名称。 */
+    public enum SerializerType {
+        /** Jackson JSON：可读性好，也是项目原来的默认行为。 */
+        JSON,
+        /** Java 原生对象流：仅建议用于学习和受信任的 Java 环境。 */
+        JDK
+    }
+
+    /** Starter 当前内置的负载均衡策略名称。 */
+    public enum LoadBalanceType {
+        /** 按服务分别维护计数器，依次循环选择 Provider。 */
+        ROUND_ROBIN,
+        /** 每次从候选 Provider 中等概率随机选择。 */
+        RANDOM
     }
 }

@@ -2,11 +2,13 @@ package com.itheima.client;
 
 import com.itheima.cluster.DefaultServiceAddressResolver;
 import com.itheima.common.RpcException;
+import com.itheima.loadbalance.LoadBalance;
 import com.itheima.loadbalance.RoundRobinLoadBalance;
 import com.itheima.proxy.RpcClientProxy;
 import com.itheima.registry.zookeeper.ZooKeeperClientFactory;
 import com.itheima.registry.zookeeper.ZooKeeperServiceDiscovery;
 import com.itheima.serialize.JsonSerializer;
+import com.itheima.serialize.Serializer;
 import com.itheima.transport.client.NettyRpcClient;
 
 import java.time.Duration;
@@ -100,6 +102,32 @@ public final class RpcClientFactory implements AutoCloseable {
             String zooKeeperAddress,
             Duration requestTimeout
     ) {
+        this(
+                zooKeeperAddress,
+                requestTimeout,
+                new JsonSerializer(),
+                new RoundRobinLoadBalance()
+        );
+    }
+
+    /**
+     * 使用指定的序列化器和负载均衡策略组装客户端调用链。
+     *
+     * <p>Spring Boot Starter 使用这个构造方法把配置文件选出的组件传入 core。
+     * core 仍然只依赖 {@link Serializer} 和 {@link LoadBalance} 接口，不需要知道
+     * Spring 配置是如何读取的。这样非 Spring 用法和原有默认构造方法也保持兼容。</p>
+     *
+     * @param zooKeeperAddress ZooKeeper 地址
+     * @param requestTimeout   默认请求等待时间
+     * @param serializer       Consumer 发送请求正文时使用的序列化器
+     * @param loadBalance      从服务地址列表中选择 Provider 的策略
+     */
+    public RpcClientFactory(
+            String zooKeeperAddress,
+            Duration requestTimeout,
+            Serializer serializer,
+            LoadBalance loadBalance
+    ) {
         this.serviceDiscovery =
                 new ZooKeeperServiceDiscovery(zooKeeperAddress);
 
@@ -107,12 +135,12 @@ public final class RpcClientFactory implements AutoCloseable {
             DefaultServiceAddressResolver addressResolver =
                     new DefaultServiceAddressResolver(
                             serviceDiscovery,
-                            new RoundRobinLoadBalance()
+                            loadBalance
                     );
 
             this.rpcClient = new NettyRpcClient(
                     addressResolver,
-                    new JsonSerializer(),
+                    serializer,
                     requestTimeout
             );
             this.proxyFactory = new RpcClientProxy(rpcClient);

@@ -10,6 +10,7 @@ import com.itheima.registry.ServiceRegistry;
 import com.itheima.registry.zookeeper.ZooKeeperClientFactory;
 import com.itheima.registry.zookeeper.ZooKeeperServiceRegistry;
 import com.itheima.serialize.JsonSerializer;
+import com.itheima.serialize.Serializer;
 import com.itheima.transport.server.NettyRpcServer;
 import com.itheima.transport.server.RpcServer;
 
@@ -94,6 +95,27 @@ public final class RpcProvider implements AutoCloseable {
             int port,
             String zooKeeperAddress
     ) {
+        this(host, port, zooKeeperAddress, new JsonSerializer());
+    }
+
+    /**
+     * 使用指定序列化器创建 Provider。
+     *
+     * <p>序列化方式决定 Provider 响应正文的编码格式。协议头会携带序列化类型，
+     * 接收端据此选择对应解码器。Starter 会把 {@code mini-rpc.serializer} 选中的
+     * 实现传到这里，业务服务不需要手动创建序列化器。</p>
+     *
+     * @param host             Consumer 能访问到的 Provider 主机地址
+     * @param port             Provider 的 Netty 监听端口
+     * @param zooKeeperAddress ZooKeeper 地址
+     * @param serializer       Provider 发送响应正文时使用的序列化器
+     */
+    public RpcProvider(
+            String host,
+            int port,
+            String zooKeeperAddress,
+            Serializer serializer
+    ) {
         this.serviceAddress = new ServiceAddress(host, port);
         this.serviceProvider = new DefaultServiceProvider();
 
@@ -101,7 +123,7 @@ public final class RpcProvider implements AutoCloseable {
                 new RpcRequestHandler(serviceProvider);
         this.rpcServer = new NettyRpcServer(
                 port,
-                new JsonSerializer(),
+                serializer,
                 requestHandler
         );
         this.serviceRegistry =

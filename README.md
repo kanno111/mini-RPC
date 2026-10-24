@@ -17,7 +17,7 @@ OpenFeign；它仍然是学习型项目，不宣称替代 Dubbo、gRPC 或 OpenF
 - [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)：实际完成的每个阶段、修改原因、
   验证结果和后续限制。此后每次修改都必须同步更新该文档。
 
-当前默认调用链使用：
+当前默认调用链使用（序列化器和负载均衡可通过 Starter 切换）：
 
 ```text
 JDK 动态代理
@@ -57,6 +57,7 @@ JDK 动态代理
 | S5-C | Netty 端口绑定成功后再发布 Provider 地址 | 已完成 |
 | S5-D | Testcontainers 真实 ZooKeeper + Netty 端到端测试 | 已完成 |
 | S5-E | `@RpcReference` 单引用超时覆盖全局配置 | 已完成 |
+| S5-F | 序列化器和负载均衡策略 Starter 配置化 | 已完成 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -164,13 +165,14 @@ mini-rpc:
   enabled: true
   registry-address: 127.0.0.1:2181
   request-timeout: 5s
+  serializer: json
+  load-balance: round-robin
   provider-enabled: false
   server-host: 127.0.0.1
   server-port: 8080
 ```
 
-`registry-address`、`request-timeout`、`provider-enabled`、`server-host` 和
-`server-port` 都已经接入实际装配。`request-timeout` 控制请求发出后等待 Provider
+这些配置都已经接入实际装配。`request-timeout` 控制请求发出后等待 Provider
 响应的最长时间，不等同于建立 TCP 连接时使用的连接超时。它是 Consumer 的全局
 默认值，单个远程引用可以通过 `@RpcReference(timeoutMillis = ...)` 覆盖：
 
@@ -181,6 +183,16 @@ private HelloService helloService;
 
 没有填写 `timeoutMillis` 时继续使用全局配置。覆盖值只改变这个代理每次调用等待
 响应的时间；不同代理仍然共享同一个 Netty 客户端、Channel 和 ZooKeeper 连接。
+
+`serializer` 决定本应用发送 RPC 正文时使用的编码方式，可选 `json`（默认）或
+`jdk`。Consumer 用它编码请求，Provider 用它编码响应；接收方根据 20 字节协议头
+中的序列化类型自动选择对应解码器。JDK 原生反序列化只适合受信任的 Java 环境，
+不应处理来源不可信的数据。
+
+`load-balance` 决定 Consumer 发现多个 Provider 时如何选址，可选
+`round-robin`（默认轮询）或 `random`（等概率随机）。业务应用也可以直接声明
+`Serializer` 或 `LoadBalance` Bean，让自动配置主动让位；但当前协议解码器只认识
+JSON 和 JDK 两种类型，自定义序列化器暂时必须与其中一种内置协议类型兼容。
 
 ### 3.4 mini-rpc-example-api
 
@@ -278,7 +290,7 @@ RpcRequest
 |---|---|
 | `Serializer` | 序列化器统一接口 |
 | `JdkSerializer` | Java 原生序列化，主要用于早期学习版本 |
-| `JsonSerializer` | Jackson JSON 序列化，当前默认实现 |
+| `JsonSerializer` | Jackson JSON 序列化，Starter 默认实现 |
 
 序列化器只负责：
 
@@ -342,6 +354,7 @@ ZooKeeper 中保存的结构：
 |---|---|
 | `LoadBalance` | 从地址列表选择一个 Provider 的接口 |
 | `RoundRobinLoadBalance` | 按服务名称分别维护计数器，实现轮询选择 |
+| `RandomLoadBalance` | 从候选 Provider 中等概率随机选择一个地址 |
 
 如果地址列表是：
 
@@ -354,6 +367,9 @@ ZooKeeper 中保存的结构：
 ```text
 8080 → 8081 → 8080 → 8081
 ```
+
+这是默认 `round-robin` 的行为；配置为 `random` 后，每次调用会独立随机选择候选
+地址，不保证短时间内请求数量完全平均。
 
 ### 4.7 cluster：服务地址解析
 
@@ -420,7 +436,7 @@ public class ConsumerApplication implements CommandLineRunner {
 
 | 类 | 作用 |
 |---|---|
-| `RpcProvider` | 组装服务表、请求处理器、Netty、JSON 和 ZooKeeper |
+| `RpcProvider` | 组装服务表、请求处理器、Netty、所选序列化器和 ZooKeeper |
 | `RpcServiceBeanDefinitionRegistryPostProcessor` | 扫描 `@RpcService` 并把类注册给 Spring |
 | `SpringRpcProviderLifecycle` | 取得 Spring 创建的服务 Bean，注册并启停 Provider |
 | `RpcServiceScanner` | 旧纯 Java 教学入口：扫描并通过无参构造方法创建服务 |
@@ -593,7 +609,7 @@ String result = helloService.sayHello("world");
                       ↓
 5. ZooKeeperServiceDiscovery 查询全部 Provider 地址
                       ↓
-6. RoundRobinLoadBalance 轮询选择一个地址
+6. 配置的 LoadBalance 策略选择一个地址
                       ↓
 7. NettyRpcClient 建立或复用目标 Channel
                       ↓
@@ -804,7 +820,7 @@ mini-rpc-example-consumer
 3. `NettyRpcClient.sendRequest(...)`；
 4. `DefaultServiceAddressResolver.resolve(...)`；
 5. `ZooKeeperServiceDiscovery.discover(...)`；
-6. `RoundRobinLoadBalance.select(...)`；
+6. 当前 `LoadBalance.select(...)`；
 7. `PendingRequestManager.register(...)`；
 8. `RpcEncoder.encode(...)`。
 
@@ -837,7 +853,8 @@ mini-rpc-example-consumer
 2. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
 3. 协议预留了心跳消息类型，但尚未实现心跳检测；
 4. 暂无失败重试、熔断、限流和降级；
-5. 序列化方式和负载均衡策略尚不能通过 Starter 配置切换；
+5. 当前只内置 JSON、JDK 两种序列化方式和轮询、随机两种负载均衡策略；还没有
+   SPI、权重、最少活跃或一致性哈希等扩展；
 6. 容器端到端测试需要本机或 CI 提供可用的 Docker 引擎；没有 Docker 时该用例
    会跳过，但不影响其余单元测试；
 7. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
@@ -847,10 +864,10 @@ mini-rpc-example-consumer
 
 ## 12. 下一步演进方向
 
-Spring 基础链路已经完整跑通。接下来优先提高 Starter 的可配置性和运行可靠性：
+Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 让序列化器和负载均衡策略可以通过 Starter 配置切换；
-2. 再逐步加入重试、心跳、优雅停机、SPI 和更多策略配置。
+1. 实现 Provider 优雅停机：先停止接收和发布新流量，再等待正在执行的请求完成；
+2. 再逐步加入 deadline 传递、心跳、有限重试、SPI 和更多策略配置。
 
 更细的 Spring 分步计划参见
 [DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。
