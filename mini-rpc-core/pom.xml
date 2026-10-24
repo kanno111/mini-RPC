@@ -73,5 +73,20 @@
             <artifactId>mockito-core</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+            S5-D 只在测试期间通过 Docker 启动真实 ZooKeeper；这些依赖不会进入
+            mini-rpc-core 的生产运行包，也不会要求业务项目引入 Testcontainers。
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

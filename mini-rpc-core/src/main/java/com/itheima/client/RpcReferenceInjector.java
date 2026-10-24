@@ -5,6 +5,7 @@ import com.itheima.common.RpcException;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -21,8 +22,10 @@ import java.util.List;
  */
 final class RpcReferenceInjector {
 
-    /** 创建 RPC 动态代理时复用的客户端工厂。 */
-    private final RpcClientFactory clientFactory;
+    /**
+     * 注入器只需要“按接口和可选超时创建代理”，不需要知道工厂怎样管理网络资源。
+     */
+    private final ProxyCreator proxyCreator;
 
     /**
      * 创建字段注入器。
@@ -30,7 +33,27 @@ final class RpcReferenceInjector {
      * @param clientFactory 已经组装好网络客户端和代理工厂的客户端入口
      */
     RpcReferenceInjector(RpcClientFactory clientFactory) {
-        this.clientFactory = clientFactory;
+        if (clientFactory == null) {
+            throw new RpcException("RpcClientFactory 不能为空");
+        }
+        this.proxyCreator = (serviceInterface, requestTimeout) ->
+                requestTimeout == null
+                        ? clientFactory.createProxy(serviceInterface)
+                        : clientFactory.createProxy(
+                                serviceInterface,
+                                requestTimeout
+                        );
+    }
+
+    /**
+     * 仅供同包测试替换“创建代理”动作，不需要模拟 final RpcClientFactory，也不会
+     * 为测试连接 ZooKeeper。生产代码仍通过上面的构造方法使用真正客户端工厂。
+     */
+    RpcReferenceInjector(ProxyCreator proxyCreator) {
+        if (proxyCreator == null) {
+            throw new RpcException("RPC 代理创建器不能为空");
+        }
+        this.proxyCreator = proxyCreator;
     }
 
     /**
@@ -59,9 +82,22 @@ final class RpcReferenceInjector {
         }
 
         for (Field field : referenceFields) {
-            Object proxy = clientFactory.createProxy(field.getType());
+            Object proxy = createProxy(field);
             setFieldValue(target, field, proxy);
         }
+    }
+
+    /** 根据注解是否覆盖超时，选择全局默认代理或单引用超时代理。 */
+    private Object createProxy(Field field) {
+        long timeoutMillis = field.getAnnotation(RpcReference.class)
+                .timeoutMillis();
+        if (timeoutMillis == RpcReference.USE_GLOBAL_TIMEOUT) {
+            return proxyCreator.createProxy(field.getType(), null);
+        }
+        return proxyCreator.createProxy(
+                field.getType(),
+                Duration.ofMillis(timeoutMillis)
+        );
     }
 
     /** 查找当前类及其父类中所有带有 {@link RpcReference} 的字段。 */
@@ -111,6 +147,17 @@ final class RpcReferenceInjector {
             );
         }
 
+        long timeoutMillis = field.getAnnotation(RpcReference.class)
+                .timeoutMillis();
+        if (timeoutMillis != RpcReference.USE_GLOBAL_TIMEOUT
+                && timeoutMillis <= 0) {
+            throw new RpcException(
+                    "@RpcReference timeoutMillis 必须大于 0，"
+                            + "或使用默认值 -1："
+                            + fieldDescription
+            );
+        }
+
         try {
             if (!field.canAccess(target) && !field.trySetAccessible()) {
                 throw new RpcException(
@@ -155,5 +202,14 @@ final class RpcReferenceInjector {
         return field.getDeclaringClass().getName()
                 + "."
                 + field.getName();
+    }
+
+    /** 注入器与完整客户端工厂之间的最小内部边界。 */
+    @FunctionalInterface
+    interface ProxyCreator {
+        Object createProxy(
+                Class<?> serviceInterface,
+                Duration requestTimeout
+        );
     }
 }

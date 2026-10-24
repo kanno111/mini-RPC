@@ -4,6 +4,8 @@ import com.itheima.common.RpcException;
 import com.itheima.common.RpcRequest;
 import com.itheima.common.RpcResponse;
 
+import java.time.Duration;
+
 /**
  * RPC 客户端的统一请求发送接口。
  *
@@ -49,4 +51,25 @@ public interface RpcClient {
      * @throws RpcException 请求无效、连接失败、数据读写失败或响应解析失败时抛出
      */
     RpcResponse sendRequest(RpcRequest request);
+
+    /**
+     * 使用本次调用指定的等待时间发送请求。
+     *
+     * <p>这个重载服务于 {@code @RpcReference(timeoutMillis = ...)}。默认方法
+     * 明确报告“不支持”，而不是悄悄忽略超时配置。最终 API 使用的 Netty 客户端
+     * 会覆盖此方法；早期 Socket 教学实现仍只保留原来的固定行为。</p>
+     *
+     * @param request        本次远程方法调用的请求数据
+     * @param requestTimeout 本次调用等待响应的最长时间
+     * @return 服务端返回的响应
+     */
+    default RpcResponse sendRequest(
+            RpcRequest request,
+            Duration requestTimeout
+    ) {
+        throw new RpcException(
+                "当前 RpcClient 实现不支持单次请求超时："
+                        + getClass().getName()
+        );
+    }
 }

@@ -939,6 +939,162 @@ Consumer 可以发现并连接 Provider
 - 当前测试使用内存替身验证顺序，真实 ZooKeeper + Netty 的可重复容器集成测试
   仍是下一步。
 
+### 3.22 S5-D：Testcontainers 真实端到端集成测试
+
+- 日期：2026-10-24
+- 对应提交：`feat: add integration tests and reference timeouts`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+此前单元测试分别验证了服务发现缓存、Watch 和 Provider 发布顺序，但注册中心与
+网络层都使用了模拟对象或内存替身。真实 ZooKeeper + Netty 链路只经过人工联调，
+无法随着 `mvn test` 重复执行，也无法自动发现后续修改造成的跨组件回归。
+
+#### 主要修改
+
+- 父 POM 引入 Testcontainers 2.0.5 BOM，统一容器测试组件版本；BOM 放在
+  Spring Boot BOM 前，避免 Boot 管理的旧 Testcontainers 版本覆盖 2.x 组件；
+- `mini-rpc-core` 增加仅测试范围的 `testcontainers` 与
+  `testcontainers-junit-jupiter` 依赖，生产运行包和业务项目不受影响；
+- 新增 `RpcEndToEndIntegrationTest`，使用固定的
+  `zookeeper:3.9.6-jre-17` 镜像和宿主机随机映射端口；
+- 测试在随机空闲端口启动真实 `RpcProvider`，使用独立 Curator 会话检查临时
+  节点，再组装真实服务发现、轮询选址、Netty 客户端和动态代理完成 RPC 调用；
+- Provider 关闭后同时等待 Netty 线程退出、ZooKeeper 临时节点删除和 Consumer
+  地址列表变空；
+- 测试将缓存 TTL 设为 30 秒，但只等待 Watch 10 秒。地址在 TTL 到期前变空，
+  可以区分“Watch 主动失效”和“缓存自然过期”；
+- 使用 `disabledWithoutDocker = true`：Docker 不可用时只跳过容器用例，不阻塞
+  与外部基础设施无关的普通单元测试；
+- README 同步更新阶段状态、测试运行方式、环境要求与下一步计划。
+
+#### 行为变化
+
+生产 RPC 行为没有变化。本阶段改变的是验证能力：Docker 可用时，根工程
+`mvn test` 会自动执行下面的真实链路：
+
+```text
+Testcontainers 启动 ZooKeeper
+        ↓
+RpcProvider 绑定随机 Netty 端口并发布临时节点
+        ↓
+Consumer 发现地址并写入 30 秒缓存
+        ↓
+动态代理发起真实 RPC 并取得响应
+        ↓
+关闭 Provider，临时节点随会话消失
+        ↓
+Watch 删除旧缓存，下一次发现得到空列表
+```
+
+#### 设计原因
+
+- 测试放在 core，是因为被验证的协议、Netty、注册中心、代理和生命周期都属于
+  core；无需启动两个 Spring Boot 示例进程，也不让 core 反向依赖 example；
+- 测试使用专用最小服务接口，避免示例业务改文案时无关地破坏框架集成测试；
+- ZooKeeper 容器端口随机映射，Provider 端口也动态选择，降低和开发者本机服务
+  冲突的概率；
+- 轮询等待异步状态并设置 10 秒上限，不使用不可解释的固定长时间休眠；
+- 没有同时引入重试、心跳或 SPI，保持本阶段只补足测试基础设施。
+
+#### 验证方式与结果
+
+- 执行 `mvn -pl mini-rpc-core -Dtest=RpcEndToEndIntegrationTest test`；
+- Testcontainers 成功启动 ZooKeeper 3.9.6，端到端用例 1 个通过，0 失败、
+  0 错误、0 跳过；
+- 用例实际验证了 RPC 响应、临时节点创建与删除、Provider 线程退出以及 Watch
+  在 30 秒 TTL 到期前让 Consumer 缓存失效；
+- Docker 未运行时预先验证了同一用例会被标记为跳过，core 其余 4 个测试通过；
+- 当前限制是执行容器用例需要可用的 Docker 引擎；下一步建议实现
+  `@RpcReference` 单引用超时覆盖全局配置。
+
+### 3.23 S5-E：@RpcReference 单引用超时覆盖全局配置
+
+- 日期：2026-10-24
+- 对应提交：`feat: add integration tests and reference timeouts`
+- 状态：已实现并验证
+
+#### 要解决的问题
+
+S5-A 已经让 `mini-rpc.request-timeout` 成为真正生效的全局配置，但所有远程引用
+只能使用同一个等待时间。快速查询和慢速报表等服务的合理超时往往不同，如果为
+每个超时创建一套客户端，又会重复创建 Netty 线程、Channel 和 ZooKeeper 连接。
+
+#### 主要修改
+
+- `@RpcReference` 新增 `timeoutMillis`，默认值 `-1` 表示继承全局配置，显式值
+  必须大于 0；
+- `RpcClient` 新增带 `Duration` 的发送重载，默认实现明确报告不支持，避免早期
+  Socket 教学客户端悄悄忽略覆盖值；
+- `NettyRpcClient` 把原有全局超时保留为默认值，同时允许每次 `sendRequest()`
+  传入本次有效超时；等待和超时异常都使用本次值；
+- `RpcClientProxy` 保存可选的单引用超时：没有覆盖时调用原发送入口，有覆盖时
+  调用带超时的入口；
+- `RpcClientFactory` 新增带 `Duration` 的 `createProxy()`，只创建轻量代理，继续
+  复用同一个 Netty 客户端、Channel 缓存和服务发现连接；
+- `RpcReferenceInjector` 读取字段注解，先统一校验所有字段，再按默认或覆盖值
+  创建代理；非法超时会在 Spring Bean 注入阶段得到包含字段名的明确错误；
+- 注入器内部依赖收窄成最小 `ProxyCreator`，使单元测试无需连接 ZooKeeper，也
+  不需要为了测试取消 `RpcClientFactory` 的 final 限制；
+- 新增注入、动态代理和 Netty 实际等待测试，并让 Testcontainers 端到端用例
+  使用显式 2 秒覆盖值完成真实 RPC；
+- README 同步增加使用示例、阶段状态和当前限制。
+
+#### 行为变化
+
+全局配置仍然提供默认值：
+
+```yaml
+mini-rpc:
+  request-timeout: 5s
+```
+
+Consumer 可以只为特定引用覆盖：
+
+```java
+@RpcReference(timeoutMillis = 750)
+private HelloService helloService;
+```
+
+调用链变为：
+
+```text
+Spring 发现 @RpcReference 字段
+        ↓
+RpcReferenceInjector 读取 timeoutMillis
+        ↓
+-1：创建使用全局默认值的代理
+正数：创建携带单引用超时的代理
+        ↓
+RpcClientProxy 每次调用传递所选超时
+        ↓
+同一个 NettyRpcClient 使用本次有效超时等待响应
+```
+
+#### 设计原因
+
+- 超时属于 Consumer 等待策略，不写入 `RpcRequest`，避免把纯客户端配置发送给
+  Provider 或改变网络协议；
+- 超时按调用传给共享客户端，而不是按引用创建客户端，避免资源数量随字段数量
+  增长；
+- 注解属性使用 `timeoutMillis` 明确单位，避免裸数字的含义不清楚；
+- `-1` 只表示“继承全局”，0 和其他负数不具备业务含义，因此尽早拒绝；
+- 保留原 `sendRequest(request)` 和构造方法，早期教学代码及现有调用保持兼容。
+
+#### 验证方式与结果
+
+- `RpcReferenceInjectorTimeoutTest` 验证默认继承、750ms 覆盖和非法 0ms；
+- `RpcClientProxyTimeoutTest` 验证代理分别选择默认发送入口和带超时入口；
+- `NettyRpcClientRequestTimeoutTest` 使用只接受连接但不响应的本地 TCP 服务端，
+  验证单次 100ms 覆盖不会继续等待全局 5 秒，并报告实际超时值；
+- `RpcEndToEndIntegrationTest` 使用单引用 2 秒超时完成真实 ZooKeeper + Netty RPC；
+- 执行 core 测试（Docker 未启动），10 个普通测试通过，容器测试按设计跳过；
+- 启动 Docker 后执行根工程 `mvn test`，core 11 个、Starter 8 个测试全部通过，
+  共 19 个测试，0 失败、0 错误、0 跳过；
+- 当前限制是注解只覆盖请求等待时间，不覆盖 TCP 连接超时；下一步建议让序列化器
+  和负载均衡策略可以通过 Starter 配置切换。
+
 ---
 
 ## 4. 接下来如何接入 Spring
@@ -984,15 +1140,17 @@ Consumer 可以发现并连接 Provider
 - 已增加 `application.yml`；
 - 已删除示例中手工组装框架组件的代码；
 - 已使用真实 ZooKeeper 与 Netty 完成端到端联调；
-- 后续仍需把真实端到端联调封装为可重复运行的容器集成测试。
+- 真实端到端联调已在 S5-D 封装为可重复运行的 Testcontainers 测试。
 
 ### S5：补齐适合 starter 的可配置和扩展能力
 
 - 状态：进行中，S5-A 全局请求超时、S5-B 缓存与 Watch、S5-C Provider 安全
-  发布顺序已完成，详细记录见 3.18～3.21；
+  发布顺序、S5-D 容器端到端测试和 S5-E 单引用超时已完成，详细记录见
+  3.18～3.23；
 - 服务发现已有短期本地缓存和 ZooKeeper Watch；
 - Provider 已改为 Netty 端口绑定成功后再发布 ZooKeeper 地址；
-- 全局请求超时已接入；单引用超时、序列化器和负载均衡策略仍待配置化；
+- 已使用 Testcontainers 自动验证真实 ZooKeeper + Netty 完整链路；
+- 全局和单引用请求超时已接入；序列化器和负载均衡策略仍待配置化；
 - 条件装配和清晰的启动失败提示；
 - 重试、心跳、优雅停机与更完整的自动化测试；
 - 视学习进度再引入 SPI，不在 Spring 基础链路之前堆叠过多功能。

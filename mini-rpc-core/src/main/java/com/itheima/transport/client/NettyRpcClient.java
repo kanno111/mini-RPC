@@ -377,6 +377,29 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      */
     @Override
     public RpcResponse sendRequest(RpcRequest request) {
+        return sendRequest(request, requestTimeoutMillis);
+    }
+
+    /**
+     * 使用当前代理指定的超时发送请求。
+     *
+     * <p>这里只覆盖本次等待时间，不修改客户端保存的全局默认值。因此不同
+     * {@code @RpcReference} 创建的代理可以共享同一个 Netty 客户端和 Channel，
+     * 同时分别使用不同的响应超时。</p>
+     */
+    @Override
+    public RpcResponse sendRequest(
+            RpcRequest request,
+            Duration requestTimeout
+    ) {
+        return sendRequest(request, validateRequestTimeout(requestTimeout));
+    }
+
+    /** 真正执行网络发送，effectiveTimeoutMillis 是本次调用最终采用的超时。 */
+    private RpcResponse sendRequest(
+            RpcRequest request,
+            long effectiveTimeoutMillis
+    ) {
         if (request == null) {
             throw new RpcException("RpcRequest 不能为空");
         }
@@ -446,13 +469,13 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
          */
         try {
             return responseFuture.get(
-                    requestTimeoutMillis,
+                    effectiveTimeoutMillis,
                     TimeUnit.MILLISECONDS
             );
         } catch (TimeoutException exception) {
             RpcException timeoutException = new RpcException(
                     "等待 RPC 响应超时，requestId：" + requestId
-                            + "，超时时间：" + requestTimeoutMillis + " 毫秒",
+                            + "，超时时间：" + effectiveTimeoutMillis + " 毫秒",
                     exception
             );
             pendingRequestManager.completeExceptionally(requestId, timeoutException);

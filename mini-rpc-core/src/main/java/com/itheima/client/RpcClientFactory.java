@@ -144,6 +144,32 @@ public final class RpcClientFactory implements AutoCloseable {
     }
 
     /**
+     * 为一个服务接口创建带有单引用超时的代理。
+     *
+     * <p>这里新建的只有轻量级 {@link RpcClientProxy} 代理工厂；底层仍复用当前
+     * {@code RpcClientFactory} 持有的同一个 NettyRpcClient、Channel 缓存和
+     * ZooKeeper 服务发现连接。</p>
+     *
+     * @param serviceInterface 服务接口
+     * @param requestTimeout   当前引用等待响应的最长时间
+     * @param <T>              服务接口类型
+     * @return 使用指定超时的动态代理
+     */
+    public <T> T createProxy(
+            Class<T> serviceInterface,
+            Duration requestTimeout
+    ) {
+        if (closed) {
+            throw new RpcException("已经关闭的 RpcClientFactory 不能创建代理");
+        }
+        return new RpcClientProxy(
+                rpcClient,
+                "1.0",
+                requestTimeout
+        ).createProxy(serviceInterface);
+    }
+
+    /**
      * 为业务对象中带有 {@code @RpcReference} 的字段注入 RPC 动态代理。
      *
      * <p>例如业务对象中声明：</p>

@@ -26,4 +26,19 @@ import java.lang.annotation.Target;
 @Target(ElementType.FIELD)
 @Retention(RetentionPolicy.RUNTIME)
 public @interface RpcReference {
+
+    /**
+     * 表示当前引用没有单独指定超时，应继续使用 Starter 的全局
+     * {@code mini-rpc.request-timeout} 配置。
+     */
+    long USE_GLOBAL_TIMEOUT = -1L;
+
+    /**
+     * 当前远程引用等待一次响应的最长毫秒数。
+     *
+     * <p>默认值 {@link #USE_GLOBAL_TIMEOUT} 表示继承全局超时。显式配置时必须
+     * 大于 0，例如 {@code @RpcReference(timeoutMillis = 750)}。超时只限制请求
+     * 发出后等待响应的时间，不等同于 TCP 建立连接的超时。</p>
+     */
+    long timeoutMillis() default USE_GLOBAL_TIMEOUT;
 }

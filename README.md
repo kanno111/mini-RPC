@@ -55,6 +55,8 @@ JDK 动态代理
 | S5-B-A | 服务发现 3 秒本地地址缓存 | 已完成 |
 | S5-B-B | ZooKeeper Watch 主动失效地址缓存 | 已完成 |
 | S5-C | Netty 端口绑定成功后再发布 Provider 地址 | 已完成 |
+| S5-D | Testcontainers 真实 ZooKeeper + Netty 端到端测试 | 已完成 |
+| S5-E | `@RpcReference` 单引用超时覆盖全局配置 | 已完成 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -169,7 +171,16 @@ mini-rpc:
 
 `registry-address`、`request-timeout`、`provider-enabled`、`server-host` 和
 `server-port` 都已经接入实际装配。`request-timeout` 控制请求发出后等待 Provider
-响应的最长时间，不等同于建立 TCP 连接时使用的连接超时。
+响应的最长时间，不等同于建立 TCP 连接时使用的连接超时。它是 Consumer 的全局
+默认值，单个远程引用可以通过 `@RpcReference(timeoutMillis = ...)` 覆盖：
+
+```java
+@RpcReference(timeoutMillis = 750)
+private HelloService helloService;
+```
+
+没有填写 `timeoutMillis` 时继续使用全局配置。覆盖值只改变这个代理每次调用等待
+响应的时间；不同代理仍然共享同一个 Netty 客户端、Channel 和 ZooKeeper 连接。
 
 ### 3.4 mini-rpc-example-api
 
@@ -390,7 +401,7 @@ Spring Boot 客户端业务只需要：
 @SpringBootApplication
 public class ConsumerApplication implements CommandLineRunner {
 
-    @RpcReference
+    @RpcReference(timeoutMillis = 750)
     private HelloService helloService;
 
     @Override
@@ -402,7 +413,8 @@ public class ConsumerApplication implements CommandLineRunner {
 
 `ConsumerApplication` 由 Spring 创建时，`RpcReferenceBeanPostProcessor` 会在
 初始化之前注入代理。只有直接使用 core 的非 Spring 项目，才需要手动创建
-`RpcClientFactory` 并调用 `injectReferences()`。
+`RpcClientFactory` 并调用 `injectReferences()`。`timeoutMillis` 必须是正数；省略
+时使用全局 `mini-rpc.request-timeout`，配置为 0 或其他负数会在注入阶段报错。
 
 ### 4.10 server：服务端高层入口
 
@@ -704,7 +716,14 @@ mvn test
 ```
 
 这条命令会编译全部模块，并运行 Starter 自动配置、延迟创建、注解处理和
-Spring 构造器注入测试。
+Spring 构造器注入测试。Docker 可用时，还会由 Testcontainers 临时启动一个
+`zookeeper:3.9.6-jre-17` 容器，执行真实 ZooKeeper + Netty 端到端测试；测试结束
+后容器自动删除，不依赖 9.2 中手工创建的 `mini-rpc-zookeeper` 容器。
+
+端到端测试会验证：Provider 注册临时节点、Consumer 发现地址并完成动态代理
+RPC、Provider 关闭后临时节点消失，以及 ZooKeeper Watch 让 Consumer 的 30 秒
+地址缓存提前失效。若 Docker 未启动，该容器用例会明确标记为跳过，其余单元测试
+仍会继续执行。
 
 ### 9.4 在 IDEA 启动 Provider
 
@@ -819,13 +838,10 @@ mini-rpc-example-consumer
 3. 协议预留了心跳消息类型，但尚未实现心跳检测；
 4. 暂无失败重试、熔断、限流和降级；
 5. 序列化方式和负载均衡策略尚不能通过 Starter 配置切换；
-6. 当前只支持 Consumer 全局 `request-timeout`，尚不支持在每个
-   `@RpcReference` 上覆盖超时；
-7. 自动化测试覆盖了 Spring 自动配置、服务扫描和 Provider 发布顺序；真实
-   ZooKeeper + Netty 调用
-   当前通过本地端到端联调验证，尚未做成可重复运行的容器集成测试；
-8. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
-9. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
+6. 容器端到端测试需要本机或 CI 提供可用的 Docker 引擎；没有 Docker 时该用例
+   会跳过，但不影响其余单元测试；
+7. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
+8. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
 ---
 
@@ -833,9 +849,8 @@ mini-rpc-example-consumer
 
 Spring 基础链路已经完整跑通。接下来优先提高 Starter 的可配置性和运行可靠性：
 
-1. 增加可重复运行的 Testcontainers 端到端集成测试；
-2. 支持 `@RpcReference` 单引用超时覆盖全局超时；
-3. 再逐步加入重试、心跳、优雅停机、SPI 和更多策略配置。
+1. 让序列化器和负载均衡策略可以通过 Starter 配置切换；
+2. 再逐步加入重试、心跳、优雅停机、SPI 和更多策略配置。
 
 更细的 Spring 分步计划参见
 [DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。
@@ -851,7 +866,7 @@ public class HelloServiceImpl implements HelloService {
 客户端：
 
 ```java
-@RpcReference
+@RpcReference(timeoutMillis = 750) // 可选；省略时继承全局超时
 private HelloService helloService;
 ```
 
