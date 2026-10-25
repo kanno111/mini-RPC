@@ -1,5 +1,6 @@
 package com.itheima.spring.autoconfigure;
 
+import com.itheima.transport.client.NettyRpcClient;
 import com.itheima.transport.server.NettyRpcServer;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -15,6 +16,8 @@ import java.time.Duration;
  *   enabled: true
  *   registry-address: 127.0.0.1:2181
  *   request-timeout: 5s
+ *   heartbeat-interval: 15s
+ *   heartbeat-timeout: 45s
  *   shutdown-timeout: 10s
  *   serializer: json
  *   load-balance: round-robin
@@ -28,8 +31,8 @@ import java.time.Duration;
  * <p>自动绑定到本类的各个字段。这里的“绑定”可以简单理解为：Spring 读取
  * 配置文件，然后调用对应的 setter 把值写入 Java 对象。</p>
  *
- * <p>目前注册中心地址、请求超时、关闭排空超时、策略选择、Provider 开关、
- * 主机、端口和 Provider 业务线程池参数都已经接入自动配置。</p>
+ * <p>目前注册中心地址、请求超时、心跳时间、关闭排空超时、策略选择、Provider
+ * 开关、主机、端口和 Provider 业务线程池参数都已经接入自动配置。</p>
  */
 @ConfigurationProperties(prefix = "mini-rpc")
 public class MiniRpcProperties {
@@ -41,7 +44,15 @@ public class MiniRpcProperties {
     private String registryAddress = "127.0.0.1:2181";
 
     /** Consumer 等待一次 RPC 响应的最长时间。 */
-    private Duration requestTimeout = Duration.ofSeconds(5);
+    private Duration requestTimeout = NettyRpcClient.DEFAULT_REQUEST_TIMEOUT;
+
+    /** Consumer Channel 写空闲多久后发送 PING。 */
+    private Duration heartbeatInterval =
+            NettyRpcClient.DEFAULT_HEARTBEAT_INTERVAL;
+
+    /** Consumer Channel 读空闲多久后关闭失效连接。 */
+    private Duration heartbeatTimeout =
+            NettyRpcClient.DEFAULT_HEARTBEAT_TIMEOUT;
 
     /** Provider 关闭时等待在途请求完成的最长时间。 */
     private Duration shutdownTimeout = Duration.ofSeconds(10);
@@ -91,6 +102,22 @@ public class MiniRpcProperties {
 
     public void setRequestTimeout(Duration requestTimeout) {
         this.requestTimeout = requestTimeout;
+    }
+
+    public Duration getHeartbeatInterval() {
+        return heartbeatInterval;
+    }
+
+    public void setHeartbeatInterval(Duration heartbeatInterval) {
+        this.heartbeatInterval = heartbeatInterval;
+    }
+
+    public Duration getHeartbeatTimeout() {
+        return heartbeatTimeout;
+    }
+
+    public void setHeartbeatTimeout(Duration heartbeatTimeout) {
+        this.heartbeatTimeout = heartbeatTimeout;
     }
 
     public Duration getShutdownTimeout() {

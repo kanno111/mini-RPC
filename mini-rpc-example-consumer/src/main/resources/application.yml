@@ -10,3 +10,6 @@ mini-rpc:
   load-balance: round-robin
   registry-address: 127.0.0.1:2181
   request-timeout: 5s
+  # 连接写空闲 15 秒时发送 PING；45 秒没有收到任何数据时关闭连接。
+  heartbeat-interval: 15s
+  heartbeat-timeout: 45s

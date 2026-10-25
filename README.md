@@ -64,7 +64,10 @@ JDK 动态代理
 | S5-H-B | Provider 执行中 deadline 协作式检查 | 已完成 |
 | S5-H-C-A | Provider Netty I/O 与业务线程隔离 | 已完成 |
 | S5-H-C-B | Provider 业务线程池配置与过载诊断 | 已完成 |
-| M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
+| S5-I-A | 心跳消息编解码与被动 PING/PONG | 已完成 |
+| S5-I-B-A | Consumer 写空闲心跳与读空闲断连 | 已完成 |
+| S5-I-B-B | Consumer 心跳时间 Starter 配置化 | 已完成 |
+| M5 | SPI、重试、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
 [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) 和续篇
@@ -172,6 +175,8 @@ mini-rpc:
   enabled: true
   registry-address: 127.0.0.1:2181
   request-timeout: 5s
+  heartbeat-interval: 15s
+  heartbeat-timeout: 45s
   shutdown-timeout: 10s
   serializer: json
   load-balance: round-robin
@@ -193,6 +198,19 @@ private HelloService helloService;
 
 没有填写 `timeoutMillis` 时继续使用全局配置。覆盖值只改变这个代理每次调用等待
 响应的时间；不同代理仍然共享同一个 Netty 客户端、Channel 和 ZooKeeper 连接。
+
+`heartbeat-interval` 控制 Consumer Channel 写空闲多久后发送 PING，默认 15 秒；
+`heartbeat-timeout` 控制连续多久没有读到 PONG 或普通响应后关闭 Channel，默认
+45 秒。两个值都必须至少为 1 毫秒，并且超时时间必须严格大于发送间隔，例如：
+
+```yaml
+mini-rpc:
+  heartbeat-interval: 10s
+  heartbeat-timeout: 30s
+```
+
+这两个值属于整个 Consumer Netty 客户端，而不是某个 `@RpcReference`。不同远程
+引用共享 Channel，因此也共享同一套连接存活判断。
 
 Netty 客户端真正发送请求前，还会把本次最终采用的超时换算成绝对 deadline，并
 写入 `RpcRequest.deadlineEpochMillis`。Provider 会在查找服务和反射调用之前检查
@@ -778,13 +796,57 @@ String result = helloService.sayHello("world");
 |---|---|
 | 魔数 | `0xCAFEBABE` |
 | 版本 | `1` |
-| 消息类型 | 请求、响应、预留心跳 |
+| 消息类型 | 请求、响应、心跳 |
 | 序列化类型 | JDK 或 JSON |
 | 状态 | 成功或失败 |
 | requestId | 匹配请求和响应 |
 | 正文长度 | 处理半包、粘包时判断一帧是否完整 |
 
 正文长度字段只记录正文有多少字节，不代表协议头中包含正文。
+
+心跳与普通调用复用这套协议，但使用独立的 `RpcHeartbeat` 正文区分 PING 和
+PONG。Provider 收到 PING 后直接在 Channel 所属的 EventLoop 中写回 PONG，
+不会进入服务表查找、业务线程池或在途业务请求计数；Consumer 也会在普通
+`RpcResponse` 匹配之前消费 PONG，因此心跳不会占用普通 RPC 的 Future。
+
+```text
+Consumer Channel                         Provider Channel
+      │                                        │
+      ├──────── RpcHeartbeat(PING) ───────────>│
+      │                              心跳 Handler 直接处理
+      │                              不进入业务线程池
+      │<──────── RpcHeartbeat(PONG) ───────────┤
+ 心跳 Handler 消费 PONG
+ 不进入 PendingRequestManager
+```
+
+Consumer 每建立一条 Provider Channel，都会安装属于该连接的 Netty
+`IdleStateHandler`：
+
+```text
+连续 15 秒没有向 Provider 写数据
+        ↓
+触发 WRITER_IDLE
+        ↓
+发送一次 PING
+
+连续 45 秒没有从 Provider 读到任何数据
+        ↓
+触发 READER_IDLE
+        ↓
+关闭失效 Channel
+        ↓
+PendingRequestManager.failAll(...)
+        ↓
+从连接缓存删除旧 Channel
+        ↓
+下一次 RPC 调用按需建立新连接
+```
+
+正常 RPC 请求也会重置写空闲时间，普通响应和 PONG 都会重置读空闲时间，因此
+业务流量活跃时不会额外发送无意义的心跳。默认 45 秒读空闲是 15 秒心跳间隔的
+三倍，用于容忍短暂抖动。空闲定时任务由每条 Channel 所属的 EventLoop 调度，
+框架没有为心跳再创建线程池。
 
 ---
 
@@ -945,7 +1007,9 @@ mini-rpc-example-consumer
 1. 服务发现已有本地缓存和一次性 ZooKeeper Watch，但当前是“变化后失效、下次
    调用再查询”，尚未在后台主动构建最新地址快照；
 2. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
-3. 协议预留了心跳消息类型，但尚未实现心跳检测；
+3. Consumer 心跳间隔和读空闲超时已支持 Starter 全局配置，但还不能按单个
+   `@RpcReference` 覆盖；Provider 侧也尚未主动清理长期不发送任何数据的客户端
+   连接；
 4. 暂无失败重试、熔断、限流和降级；
 5. 当前只内置 JSON、JDK 两种序列化方式和轮询、随机两种负载均衡策略；还没有
    SPI、权重、最少活跃或一致性哈希等扩展；
@@ -966,8 +1030,11 @@ mini-rpc-example-consumer
 
 Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 设计 deadline 到达时的任务中断和“响应只完成一次”保护；
-2. 再逐步加入心跳、有限重试、SPI 和更多策略配置。
+1. 为 Provider 增加客户端读空闲清理，避免 Consumer 进程异常退出或网络静默
+   断开后长期保留半开 Channel；
+2. 再逐步加入有限重试、SPI 和更多策略配置；
+3. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
+   执行前检查与协作式检查，因此暂缓到确有需求时再实现，避免过度设计。
 
 更细的 Spring 分步计划参见
 [DEVELOPMENT_LOG.md 的“接下来如何接入 Spring”](DEVELOPMENT_LOG.md#4-接下来如何接入-spring)。

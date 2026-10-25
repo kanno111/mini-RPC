@@ -1,6 +1,7 @@
 package com.itheima.transport.codec;
 
 import com.itheima.common.RpcException;
+import com.itheima.common.RpcHeartbeat;
 import com.itheima.common.RpcProtocol;
 import com.itheima.common.RpcRequest;
 import com.itheima.common.RpcResponse;
@@ -35,7 +36,7 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
      */
     private static final int MAX_MESSAGE_LENGTH = 10 * 1024 * 1024;
 
-    /** 负责把 RpcRequest 或 RpcResponse 转换成 byte[]。 */
+    /** 负责把请求、响应或心跳对象转换成 byte[]。 */
     private final Serializer serializer;
 
     /**
@@ -57,7 +58,7 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
      * 向里面写数据，不需要自己创建、发送或释放这个 ByteBuf。</p>
      *
      * @param context 当前 Channel 对应的处理器上下文，本步骤暂时不需要使用
-     * @param message 准备发送的 Java 消息对象，例如 RpcRequest 或 RpcResponse
+     * @param message 准备发送的 Java 消息对象，例如请求、响应或心跳
      * @param output  Netty 提供的输出缓冲区
      */
     @Override
@@ -76,7 +77,8 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
 
         /*
          * 第一步：根据 Java 对象类型生成协议头中的消息元数据。
-         * 当前只允许发送 RpcRequest 和 RpcResponse，其他对象没有对应的协议类型。
+         * 当前允许发送 RpcRequest、RpcResponse 和 RpcHeartbeat，其他对象没有
+         * 对应的协议类型。
          */
         if (message instanceof RpcRequest request) {
             messageType = RpcProtocol.MESSAGE_TYPE_REQUEST;
@@ -89,6 +91,12 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
                     ? RpcProtocol.STATUS_SUCCESS
                     : RpcProtocol.STATUS_FAILURE;
             requestId = response.getRequestId();
+        } else if (message instanceof RpcHeartbeat heartbeat) {
+            messageType = RpcProtocol.MESSAGE_TYPE_HEARTBEAT;
+            // 心跳不是业务执行结果，状态字段与普通请求一样固定为 0。
+            status = RpcProtocol.STATUS_SUCCESS;
+            requestId = heartbeat.getRequestId();
+            validateHeartbeat(heartbeat);
         } else {
             throw new RpcException(
                     "不支持编码的 RPC 消息类型：" + message.getClass().getName()
@@ -108,7 +116,7 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
         output.writeInt(RpcProtocol.MAGIC_NUMBER);     // 0~3：魔数，4 字节
         output.writeByte(RpcProtocol.VERSION);         // 4：协议版本，1 字节
         output.writeByte(serializer.getType());        // 5：序列化类型，1 字节
-        output.writeByte(messageType);                 // 6：请求或响应，1 字节
+        output.writeByte(messageType);                 // 6：请求、响应或心跳，1 字节
         output.writeByte(status);                      // 7：响应状态，1 字节
         output.writeLong(requestId);                   // 8~15：请求编号，8 字节
         output.writeInt(body.length);                  // 16~19：正文长度，4 字节
@@ -121,6 +129,21 @@ public class RpcEncoder extends MessageToByteEncoder<Object> {
     private void validateRequestId(long requestId) {
         if (requestId <= 0) {
             throw new RpcException("RPC requestId 必须大于 0：" + requestId);
+        }
+    }
+
+    /** 拒绝无法识别或缺少有效创建时间的心跳，避免发送语义不完整的报文。 */
+    private void validateHeartbeat(RpcHeartbeat heartbeat) {
+        byte heartbeatType = heartbeat.getHeartbeatType();
+        if (heartbeatType != RpcHeartbeat.TYPE_PING
+                && heartbeatType != RpcHeartbeat.TYPE_PONG) {
+            throw new RpcException("不支持的 RPC 心跳类型：" + heartbeatType);
+        }
+        if (heartbeat.getTimestampEpochMillis() <= 0) {
+            throw new RpcException(
+                    "RPC 心跳时间戳必须大于 0："
+                            + heartbeat.getTimestampEpochMillis()
+            );
         }
     }
 

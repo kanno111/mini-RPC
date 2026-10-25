@@ -48,7 +48,7 @@ public class JsonSerializer implements Serializer {
      * <p>{@link ObjectMapper#writeValueAsBytes(Object)} 会先把对象转换成 JSON，
      * 再直接生成 UTF-8 字节，避免先得到 String 后又手动转换一次。</p>
      *
-     * @param object 要转换的对象，通常是 RpcRequest 或 RpcResponse
+     * @param object 要转换的对象，通常是请求、响应或心跳
      * @return JSON 格式的 UTF-8 字节数组
      */
     @Override

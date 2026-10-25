@@ -47,7 +47,8 @@ public final class RpcProtocol {
     /**
      * 表示当前消息是一条心跳消息。
      *
-     * <p>心跳用于确认连接是否仍然可用，M0 阶段只预留类型，暂不实现心跳功能。</p>
+     * <p>心跳用于确认连接是否仍然可用。S5-I-A 开始支持被动 PING/PONG，自动
+     * 发送和超时断连会在后续阶段接入。</p>
      */
     public static final byte MESSAGE_TYPE_HEARTBEAT = 3;
 

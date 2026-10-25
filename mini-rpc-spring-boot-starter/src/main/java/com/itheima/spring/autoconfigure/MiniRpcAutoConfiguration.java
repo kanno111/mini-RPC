@@ -151,6 +151,8 @@ public class MiniRpcAutoConfiguration {
         return new RpcClientFactory(
                 properties.getRegistryAddress(),
                 properties.getRequestTimeout(),
+                properties.getHeartbeatInterval(),
+                properties.getHeartbeatTimeout(),
                 serializer,
                 loadBalance
         );

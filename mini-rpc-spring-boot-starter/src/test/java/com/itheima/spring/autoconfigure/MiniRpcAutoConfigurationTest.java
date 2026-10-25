@@ -53,6 +53,8 @@ class MiniRpcAutoConfigurationTest {
                 .withPropertyValues(
                         "mini-rpc.registry-address=192.168.1.10:2181",
                         "mini-rpc.request-timeout=8s",
+                        "mini-rpc.heartbeat-interval=7s",
+                        "mini-rpc.heartbeat-timeout=21s",
                         "mini-rpc.shutdown-timeout=12s",
                         "mini-rpc.serializer=jdk",
                         "mini-rpc.load-balance=random",
@@ -71,6 +73,10 @@ class MiniRpcAutoConfigurationTest {
                             .isEqualTo("192.168.1.10:2181");
                     assertThat(properties.getRequestTimeout())
                             .isEqualTo(Duration.ofSeconds(8));
+                    assertThat(properties.getHeartbeatInterval())
+                            .isEqualTo(Duration.ofSeconds(7));
+                    assertThat(properties.getHeartbeatTimeout())
+                            .isEqualTo(Duration.ofSeconds(21));
                     assertThat(properties.getShutdownTimeout())
                             .isEqualTo(Duration.ofSeconds(12));
                     assertThat(properties.getSerializer())

@@ -17,6 +17,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,7 +44,7 @@ import java.util.concurrent.TimeoutException;
  *      ├── Bootstrap：保存客户端连接配置
  *      ├── ServiceAddressResolver：为每次请求选择 Provider 地址
  *      ├── Channel 缓存：每个 Provider 地址复用一条连接
- *      └── Pipeline：负责编码请求、解码响应和匹配 Future
+ *      └── Pipeline：负责编解码、心跳分流和匹配业务 Future
  * </pre>
  */
 public class NettyRpcClient implements RpcClient, AutoCloseable {
@@ -63,6 +64,24 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
             Duration.ofSeconds(5);
 
     /**
+     * Channel 连续 15 秒没有发送业务数据时，自动发送一次 PING。
+     *
+     * <p>这是 core 的安全默认值；Spring Starter 未配置 heartbeat-interval 时
+     * 使用它，业务应用也可以在 application.yml 中覆盖。</p>
+     */
+    public static final Duration DEFAULT_HEARTBEAT_INTERVAL =
+            Duration.ofSeconds(15);
+
+    /**
+     * Channel 连续 45 秒没有收到 PONG 或普通响应时，主动关闭这条连接。
+     *
+     * <p>超时时间是默认心跳间隔的三倍，允许短暂网络抖动，不会因为单个 PONG
+     * 延迟就立刻断开。</p>
+     */
+    public static final Duration DEFAULT_HEARTBEAT_TIMEOUT =
+            Duration.ofSeconds(45);
+
+    /**
      * Channel 上用于保存 PendingRequestManager 的属性键。
      *
      * <p>Netty 允许给每条 Channel 附加自己的属性。以后客户端同时连接多个
@@ -75,7 +94,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /** 根据请求中的接口名称，找到本次调用应使用的 Provider 地址。 */
     private final ServiceAddressResolver addressResolver;
 
-    /** 请求和响应正文共用的序列化器。 */
+    /** 请求、响应和心跳正文共用的序列化器。 */
     private final Serializer serializer;
 
     /**
@@ -84,6 +103,12 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      * <p>它只限制“请求发出后等待响应”的时间，不等同于上面的 TCP 连接超时。</p>
      */
     private final long requestTimeoutMillis;
+
+    /** 当前 Channel 连续多久没有写数据后发送 PING。 */
+    private final long heartbeatIntervalMillis;
+
+    /** 当前 Channel 连续多久没有读到任何数据后判定连接失效。 */
+    private final long heartbeatTimeoutMillis;
 
     /**
      * 已经建立的连接缓存：key 是 Provider 地址，value 是对应的 Netty Channel。
@@ -107,6 +132,10 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
     /** Netty 客户端启动器，可以理解为创建连接时使用的配置模板。 */
     private final Bootstrap bootstrap;
 
+    /** 所有客户端 Channel 共享的线程安全心跳处理器。 */
+    private final NettyRpcClientHeartbeatHandler heartbeatHandler =
+            new NettyRpcClientHeartbeatHandler();
+
     /** 客户端是否已经被永久关闭。关闭后不允许重新连接。 */
     private volatile boolean closed;
 
@@ -118,7 +147,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      *
      * @param host       服务端主机名或 IP，例如 127.0.0.1
      * @param port       服务端端口，范围是 1 到 65535
-     * @param serializer 请求和响应使用的序列化器
+     * @param serializer 请求、响应和心跳使用的序列化器
      */
     public NettyRpcClient(String host, int port, Serializer serializer) {
         this(
@@ -133,7 +162,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      *
      * @param host           服务端主机名或 IP
      * @param port           服务端端口
-     * @param serializer     请求和响应使用的序列化器
+     * @param serializer     请求、响应和心跳使用的序列化器
      * @param requestTimeout 请求响应超时时间，最小为 1 毫秒
      */
     public NettyRpcClient(
@@ -162,7 +191,13 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
             ServiceAddressResolver addressResolver,
             Serializer serializer
     ) {
-        this(addressResolver, serializer, DEFAULT_REQUEST_TIMEOUT);
+        this(
+                addressResolver,
+                serializer,
+                DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_HEARTBEAT_TIMEOUT
+        );
     }
 
     /**
@@ -177,6 +212,35 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
             Serializer serializer,
             Duration requestTimeout
     ) {
+        this(
+                addressResolver,
+                serializer,
+                requestTimeout,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_HEARTBEAT_TIMEOUT
+        );
+    }
+
+    /**
+     * 创建使用指定请求超时和心跳参数的 Netty 客户端。
+     *
+     * <p>Spring Boot Starter 使用这个完整构造方法，把 application.yml 中的
+     * 三个 Duration 一直传到真正创建 Channel 的位置。旧构造方法继续委托到这里，
+     * 因此直接使用 core 的早期教学代码仍然获得原有默认行为。</p>
+     *
+     * @param addressResolver  服务地址解析器
+     * @param serializer       请求、响应和心跳正文使用的序列化器
+     * @param requestTimeout   单次业务请求等待响应的最长时间
+     * @param heartbeatInterval Channel 写空闲多久后发送 PING
+     * @param heartbeatTimeout  Channel 读空闲多久后关闭连接，必须大于心跳间隔
+     */
+    public NettyRpcClient(
+            ServiceAddressResolver addressResolver,
+            Serializer serializer,
+            Duration requestTimeout,
+            Duration heartbeatInterval,
+            Duration heartbeatTimeout
+    ) {
         if (addressResolver == null) {
             throw new RpcException("ServiceAddressResolver 不能为空");
         }
@@ -187,6 +251,21 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
         this.addressResolver = addressResolver;
         this.serializer = serializer;
         this.requestTimeoutMillis = validateRequestTimeout(requestTimeout);
+        this.heartbeatIntervalMillis = validatePositiveDuration(
+                heartbeatInterval,
+                "RPC 心跳间隔"
+        );
+        this.heartbeatTimeoutMillis = validatePositiveDuration(
+                heartbeatTimeout,
+                "RPC 心跳超时时间"
+        );
+        if (heartbeatTimeoutMillis <= heartbeatIntervalMillis) {
+            throw new RpcException(
+                    "RPC 心跳超时时间必须大于心跳间隔：超时="
+                            + heartbeatTimeoutMillis + "ms，间隔="
+                            + heartbeatIntervalMillis + "ms"
+            );
+        }
 
         /*
          * Netty 4.2 把事件循环线程组和具体 I/O 实现分开配置。
@@ -220,11 +299,43 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
         return timeoutMillis;
     }
 
+    /** 把心跳 Duration 转成毫秒，并在创建 Netty 线程前拒绝空值或非正数。 */
+    private static long validatePositiveDuration(
+            Duration duration,
+            String configurationName
+    ) {
+        if (duration == null) {
+            throw new RpcException(configurationName + "不能为空");
+        }
+
+        final long durationMillis;
+        try {
+            durationMillis = duration.toMillis();
+        } catch (ArithmeticException exception) {
+            throw new RpcException(configurationName + "过大", exception);
+        }
+
+        if (durationMillis <= 0) {
+            throw new RpcException(configurationName + "不能小于 1 毫秒");
+        }
+        return durationMillis;
+    }
+
     /**
      * 返回当前真正参与请求等待的超时时间，便于测试和运行诊断。
      */
     public Duration getRequestTimeout() {
         return Duration.ofMillis(requestTimeoutMillis);
+    }
+
+    /** 返回当前真正参与写空闲检测的心跳间隔。 */
+    public Duration getHeartbeatInterval() {
+        return Duration.ofMillis(heartbeatIntervalMillis);
+    }
+
+    /** 返回当前真正参与读空闲检测的心跳超时时间。 */
+    public Duration getHeartbeatTimeout() {
+        return Duration.ofMillis(heartbeatTimeoutMillis);
     }
 
     /** 把旧版的固定 host、port 包装成地址解析器。 */
@@ -269,7 +380,7 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
      * 为客户端连接安装处理器。
      *
      * <p>客户端和服务端使用同一套 M3 自定义协议。解码器会读取协议头中的消息类型，
-     * 自动判断正文应该还原成 RpcRequest 还是 {@link RpcResponse}。</p>
+     * 自动判断正文应该还原成 RpcRequest、{@link RpcResponse} 还是心跳对象。</p>
      */
     private void configurePipeline(SocketChannel socketChannel) {
         /*
@@ -290,10 +401,23 @@ public class NettyRpcClient implements RpcClient, AutoCloseable {
                 .set(channelPendingRequests);
 
         socketChannel.pipeline()
-                // 入站：等待完整的 M3 协议帧，并把正文反序列化成 RpcResponse。
+                /*
+                 * 每条 Channel 都必须拥有自己的 IdleStateHandler，因为它内部保存
+                 * 该连接的最后读写时间和定时任务，不能像无状态 Handler 那样共享。
+                 * 定时任务由 Channel 所属 EventLoop 调度，不会新增心跳线程池。
+                 */
+                .addLast(new IdleStateHandler(
+                        heartbeatTimeoutMillis,
+                        heartbeatIntervalMillis,
+                        0L,
+                        TimeUnit.MILLISECONDS
+                ))
+                // 入站：等待完整协议帧，并按消息类型还原响应或心跳。
                 .addLast(new RpcDecoder())
-                // 出站：发送 RpcRequest 时，把它编码成“20 字节协议头 + 正文”。
+                // 出站：把请求或心跳编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
+                // 入站：先消费 PONG，避免心跳进入普通 RPC 的 Future 匹配逻辑。
+                .addLast(heartbeatHandler)
                 // 入站：只在当前 Channel 的等待请求表中匹配 response。
                 .addLast(new NettyRpcClientHandler(channelPendingRequests));
     }

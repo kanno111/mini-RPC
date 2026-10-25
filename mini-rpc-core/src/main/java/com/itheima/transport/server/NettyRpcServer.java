@@ -34,8 +34,10 @@ import java.util.concurrent.TimeUnit;
  *      ↓
  * 每条连接自己的 Pipeline
  *      ↓
- * RpcDecoder → RpcEncoder → NettyRpcServerHandler
- *      ↓
+ * RpcDecoder → RpcEncoder → 心跳 Handler → NettyRpcServerHandler
+ *                        ↓                      ↓
+ *                 PING 直接回复 PONG
+ *                                               ↓
  * ProviderBusinessExecutor：执行服务查找和业务方法
  * </pre>
  */
@@ -59,11 +61,15 @@ public class NettyRpcServer implements RpcServer {
     /** 服务端要监听的端口。 */
     private final int port;
 
-    /** 请求和响应共用的正文序列化器。 */
+    /** 请求、响应和心跳正文共用的序列化器。 */
     private final Serializer serializer;
 
     /** 可以被所有客户端连接共享的服务端业务处理器。 */
     private final NettyRpcServerHandler serverHandler;
+
+    /** 所有客户端连接共享的无状态心跳处理器。 */
+    private final NettyRpcServerHeartbeatHandler heartbeatHandler =
+            new NettyRpcServerHeartbeatHandler();
 
     /** 关闭时等待在途请求完成的最长时间。 */
     private final Duration shutdownTimeout;
@@ -287,10 +293,12 @@ public class NettyRpcServer implements RpcServer {
      */
     private void configurePipeline(SocketChannel channel) {
         channel.pipeline()
-                // 入站：等待完整的 M3 协议帧，并把正文反序列化成 RpcRequest。
+                // 入站：等待完整协议帧，并按消息类型还原请求或心跳。
                 .addLast(new RpcDecoder())
-                // 出站：把 RpcResponse 编码成“20 字节协议头 + 正文”。
+                // 出站：把响应或心跳编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
+                // 入站：PING 在 EventLoop 中直接回复 PONG，不进入业务线程池。
+                .addLast(heartbeatHandler)
                 // 入站：把请求分发到业务线程池，完成后再写回响应。
                 .addLast(serverHandler);
     }

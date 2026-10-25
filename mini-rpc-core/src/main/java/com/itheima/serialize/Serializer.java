@@ -23,9 +23,10 @@ public interface Serializer {
      * 把 Java 对象序列化成字节数组。
      *
      * <p>客户端发送请求前，会把 {@code RpcRequest} 转换成字节数组；
-     * 服务端返回结果前，会把 {@code RpcResponse} 转换成字节数组。</p>
+     * 服务端返回结果前，会把 {@code RpcResponse} 转换成字节数组；心跳对象也
+     * 复用同一接口，不需要另写一套正文格式。</p>
      *
-     * @param object 要转换的 Java 对象，通常是 RpcRequest 或 RpcResponse
+     * @param object 要转换的 Java 对象，通常是请求、响应或心跳
      * @return 可以通过网络发送的字节数组
      * @throws RpcException 对象无法被当前序列化器处理时抛出
      */

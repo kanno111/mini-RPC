@@ -1,6 +1,7 @@
 package com.itheima.transport.codec;
 
 import com.itheima.common.RpcException;
+import com.itheima.common.RpcHeartbeat;
 import com.itheima.common.RpcProtocol;
 import com.itheima.common.RpcRequest;
 import com.itheima.common.RpcResponse;
@@ -14,7 +15,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import java.util.List;
 
 /**
- * 把 M3 自定义协议帧解码成 {@link RpcRequest} 或 {@link RpcResponse}。
+ * 把 M3 自定义协议帧解码成请求、响应或心跳对象。
  *
  * <p>本类直接继承 {@link ByteToMessageDecoder}，因此它现在负责两件事：</p>
  *
@@ -32,7 +33,7 @@ import java.util.List;
  *    ↓
  * 正文还没收完整：恢复读取位置，继续等待后续网络数据
  *    ↓
- * 正文已经收完整：反序列化成 RpcRequest 或 RpcResponse
+ * 正文已经收完整：按消息类型反序列化成请求、响应或心跳对象
  * </pre>
  *
  * <p>M2 中曾在它前面放置 {@code LengthFieldBasedFrameDecoder} 来切分消息。
@@ -171,6 +172,8 @@ public class RpcDecoder extends ByteToMessageDecoder {
                     serializer.deserialize(body, RpcRequest.class);
             case RpcProtocol.MESSAGE_TYPE_RESPONSE ->
                     serializer.deserialize(body, RpcResponse.class);
+            case RpcProtocol.MESSAGE_TYPE_HEARTBEAT ->
+                    serializer.deserialize(body, RpcHeartbeat.class);
             default -> throw new RpcException(
                     "当前阶段不支持解码的 RPC 消息类型：" + messageType
             );
@@ -197,10 +200,11 @@ public class RpcDecoder extends ByteToMessageDecoder {
         }
     }
 
-    /** 当前协议只定义了请求和响应两种普通消息。 */
+    /** 当前协议支持普通请求、普通响应和心跳三种消息。 */
     private void validateMessageType(byte messageType) {
         if (messageType != RpcProtocol.MESSAGE_TYPE_REQUEST
-                && messageType != RpcProtocol.MESSAGE_TYPE_RESPONSE) {
+                && messageType != RpcProtocol.MESSAGE_TYPE_RESPONSE
+                && messageType != RpcProtocol.MESSAGE_TYPE_HEARTBEAT) {
             throw new RpcException("不支持的 RPC 消息类型：" + messageType);
         }
     }
@@ -210,9 +214,12 @@ public class RpcDecoder extends ByteToMessageDecoder {
      * 响应状态只能是成功或失败。
      */
     private void validateStatus(byte messageType, byte status) {
-        if (messageType == RpcProtocol.MESSAGE_TYPE_REQUEST) {
+        if (messageType == RpcProtocol.MESSAGE_TYPE_REQUEST
+                || messageType == RpcProtocol.MESSAGE_TYPE_HEARTBEAT) {
             if (status != RpcProtocol.STATUS_SUCCESS) {
-                throw new RpcException("RPC 请求的状态字段必须为 0：" + status);
+                throw new RpcException(
+                        "RPC 请求或心跳的状态字段必须为 0：" + status
+                );
             }
             return;
         }
@@ -253,6 +260,29 @@ public class RpcDecoder extends ByteToMessageDecoder {
                 throw new RpcException(
                         "RPC 请求头与正文的 requestId 不一致，协议头："
                                 + headerRequestId + "，正文：" + request.getRequestId()
+                );
+            }
+            return;
+        }
+
+        if (message instanceof RpcHeartbeat heartbeat) {
+            if (heartbeat.getRequestId() != headerRequestId) {
+                throw new RpcException(
+                        "RPC 心跳头与正文的 requestId 不一致，协议头："
+                                + headerRequestId + "，正文："
+                                + heartbeat.getRequestId()
+                );
+            }
+
+            byte heartbeatType = heartbeat.getHeartbeatType();
+            if (heartbeatType != RpcHeartbeat.TYPE_PING
+                    && heartbeatType != RpcHeartbeat.TYPE_PONG) {
+                throw new RpcException("不支持的 RPC 心跳类型：" + heartbeatType);
+            }
+            if (heartbeat.getTimestampEpochMillis() <= 0) {
+                throw new RpcException(
+                        "RPC 心跳时间戳必须大于 0："
+                                + heartbeat.getTimestampEpochMillis()
                 );
             }
             return;

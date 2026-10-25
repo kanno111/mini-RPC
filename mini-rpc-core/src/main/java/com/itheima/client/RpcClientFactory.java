@@ -92,8 +92,8 @@ public final class RpcClientFactory implements AutoCloseable {
     /**
      * 使用指定 ZooKeeper 地址和请求超时时间创建客户端工厂。
      *
-     * <p>Spring Starter 会走这个构造方法，把 application.yml 中已经绑定成
-     * {@link Duration} 的 request-timeout 一直传到 NettyRpcClient。</p>
+     * <p>这个兼容构造方法适合非 Spring 的手动入口：请求超时由调用方指定，
+     * 心跳继续使用 core 默认值。Spring Starter 会使用下面的完整构造方法。</p>
      *
      * @param zooKeeperAddress ZooKeeper 地址，例如 {@code 127.0.0.1:2181}
      * @param requestTimeout   每次请求等待 Provider 响应的最长时间
@@ -113,9 +113,9 @@ public final class RpcClientFactory implements AutoCloseable {
     /**
      * 使用指定的序列化器和负载均衡策略组装客户端调用链。
      *
-     * <p>Spring Boot Starter 使用这个构造方法把配置文件选出的组件传入 core。
-     * core 仍然只依赖 {@link Serializer} 和 {@link LoadBalance} 接口，不需要知道
-     * Spring 配置是如何读取的。这样非 Spring 用法和原有默认构造方法也保持兼容。</p>
+     * <p>该构造方法适合手动选择序列化器和负载均衡器，并继续使用默认心跳时间。
+     * core 仍然只依赖 {@link Serializer} 和 {@link LoadBalance} 接口；需要自定义
+     * 心跳时使用下面的完整构造方法。</p>
      *
      * @param zooKeeperAddress ZooKeeper 地址
      * @param requestTimeout   默认请求等待时间
@@ -125,6 +125,38 @@ public final class RpcClientFactory implements AutoCloseable {
     public RpcClientFactory(
             String zooKeeperAddress,
             Duration requestTimeout,
+            Serializer serializer,
+            LoadBalance loadBalance
+    ) {
+        this(
+                zooKeeperAddress,
+                requestTimeout,
+                NettyRpcClient.DEFAULT_HEARTBEAT_INTERVAL,
+                NettyRpcClient.DEFAULT_HEARTBEAT_TIMEOUT,
+                serializer,
+                loadBalance
+        );
+    }
+
+    /**
+     * 使用完整的 Consumer 超时与策略配置组装客户端调用链。
+     *
+     * <p>这个构造方法是 Spring Boot Starter 到 core 的配置边界。Starter 只负责
+     * 把文本配置绑定成 {@link Duration} 和策略对象，真正的心跳参数校验以及
+     * IdleStateHandler 装配仍由 {@link NettyRpcClient} 负责。</p>
+     *
+     * @param zooKeeperAddress  ZooKeeper 地址
+     * @param requestTimeout    默认请求等待时间
+     * @param heartbeatInterval Channel 写空闲多久后发送 PING
+     * @param heartbeatTimeout  Channel 读空闲多久后关闭连接
+     * @param serializer        Consumer 发送消息正文时使用的序列化器
+     * @param loadBalance       从服务地址列表中选择 Provider 的策略
+     */
+    public RpcClientFactory(
+            String zooKeeperAddress,
+            Duration requestTimeout,
+            Duration heartbeatInterval,
+            Duration heartbeatTimeout,
             Serializer serializer,
             LoadBalance loadBalance
     ) {
@@ -141,7 +173,9 @@ public final class RpcClientFactory implements AutoCloseable {
             this.rpcClient = new NettyRpcClient(
                     addressResolver,
                     serializer,
-                    requestTimeout
+                    requestTimeout,
+                    heartbeatInterval,
+                    heartbeatTimeout
             );
             this.proxyFactory = new RpcClientProxy(rpcClient);
         } catch (RuntimeException exception) {
