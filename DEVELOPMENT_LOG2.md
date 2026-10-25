@@ -106,7 +106,7 @@ ProviderBusinessExecutor
 ### 3.31 S5-I-A：心跳消息编解码与被动 PING/PONG
 
 - 日期：2026-10-25
-- 对应提交：本次心跳阶段提交
+- 对应提交：`5411ad8`
 - 状态：已实现并验证
 
 #### 目标
@@ -203,7 +203,7 @@ NettyRpcClientHeartbeatHandler
 ### 3.32 S5-I-B-A：Consumer 写空闲心跳与读空闲断连
 
 - 日期：2026-10-25
-- 对应提交：本次心跳阶段提交
+- 对应提交：`5411ad8`
 - 状态：已实现并验证
 
 #### 目标
@@ -311,7 +311,7 @@ closeFuture listener 删除 channels 中的旧连接
 ### 3.33 S5-I-B-B：Consumer 心跳时间 Starter 配置化
 
 - 日期：2026-10-25
-- 对应提交：本次心跳阶段提交
+- 对应提交：`5411ad8`
 - 状态：已实现并验证
 
 #### 目标
@@ -398,3 +398,166 @@ Spring 管理的 Netty 客户端在应用运行期间不会动态替换这两个
 - 心跳与断线次数仍只体现在日志和行为中，没有接入 Micrometer；
 - 下一步建议实现 S5-I-C：Provider 使用读空闲检测清理静默客户端 Channel，且
   Provider 的读空闲阈值应明显大于 Consumer 的心跳间隔。
+
+### 3.34 S5-I-C：Provider 静默客户端 Channel 清理
+
+- 日期：2026-10-25
+- 对应提交：本次 Provider 连接清理与心跳可观察性阶段提交
+- 状态：已实现并验证
+
+#### 目标
+
+Consumer 已能发现 Provider 长期无响应并关闭连接，但反方向仍不完整：Consumer
+进程崩溃、机器断网或中间网络设备静默丢弃连接时，Provider 可能暂时保留一条
+表面未关闭、实际不会再发送数据的半开 Channel。本步让 Provider 按每条客户端
+连接的读空闲时间清理这类静默连接。
+
+#### 主要修改
+
+- `NettyRpcServer` 新增默认 60 秒 `DEFAULT_CLIENT_IDLE_TIMEOUT` 和实例毫秒字段；
+- 服务端每条客户端 Channel 的 Pipeline 头部创建独立 `IdleStateHandler`，只启用
+  reader-idle，不观察 Provider 自己的写空闲；
+- 新增共享的 `NettyRpcServerIdleConnectionHandler`，收到 READER_IDLE 时只关闭
+  当前客户端 Channel，其他用户事件继续传播；
+- `NettyRpcServer` 新增完整构造方法、正数校验和诊断 getter，旧构造方法继续使用
+  60 秒默认值；
+- `RpcProvider` 增加完整构造方法，把客户端读空闲参数传到 Netty 服务端，同时
+  保留旧构造方法兼容；
+- `MiniRpcProperties` 新增 `providerClientIdleTimeout`，绑定
+  `mini-rpc.provider-client-idle-timeout`；
+- `MiniRpcAutoConfiguration` 将配置继续传给 `RpcProvider`；
+- Provider 示例 `application.yml` 增加 60 秒配置与说明；
+- 新增 Provider 读空闲处理器、配置生效和非法配置测试，并扩展 Starter 属性绑定；
+- README 同步更新完成状态、配置说明、运行行为和限制。
+
+#### 行为变化与调用链
+
+Provider 现在可以配置：
+
+```yaml
+mini-rpc:
+  provider-client-idle-timeout: 60s
+```
+
+配置传递链为：
+
+```text
+application.yml
+        ↓
+MiniRpcProperties
+        ↓
+MiniRpcAutoConfiguration
+        ↓
+RpcProvider
+        ↓
+NettyRpcServer
+        ↓
+每条客户端 Channel 自己的 IdleStateHandler
+```
+
+运行链路为：
+
+```text
+普通 RpcRequest 或 PING 到达 Provider
+        ↓
+该 Channel 的最后读取时间刷新
+
+连续 60 秒没有任何入站数据
+        ↓
+IdleStateHandler 触发 READER_IDLE
+        ↓
+NettyRpcServerIdleConnectionHandler
+        ↓
+只关闭当前客户端 Channel
+```
+
+服务端监听 Channel、其他 Consumer Channel、worker EventLoopGroup 和业务线程池
+不会被这个事件关闭。若该连接仍有业务任务执行，任务完成后的响应写入会失败并
+通过原有 listener 归还在途计数；Java 框架不会强制终止用户业务代码。
+
+#### 设计原因
+
+- `IdleStateHandler` 放在解码器之前观察实际入站字节，普通请求和 PING 都可以证明
+  客户端仍存活，不需要额外维护“最后一次心跳时间”字段；
+- Provider 只需要 reader-idle：心跳由 Consumer 发起，Provider 没有必要再维护
+  第二套主动 PING，避免双向心跳增加协议和状态复杂度；
+- 每条 Channel 创建独立 IdleStateHandler，因为其中保存连接级时间与定时任务；
+  关闭动作处理器无连接状态，可以安全共享；
+- 默认 60 秒是 Consumer 默认 15 秒心跳间隔的四倍，允许短暂抖动和少量心跳丢失；
+- Provider 与 Consumer 属于不同进程，无法在启动时可靠比较双方配置，因此只校验
+  Provider 阈值为正数，并在文档中要求部署者让它明显大于 Consumer 心跳间隔；
+- 清理只针对子 Channel，不调用 `NettyRpcServer.stop()`，防止一个异常客户端影响
+  整个 Provider 和其他 Consumer。
+
+#### 验证方式
+
+- `NettyRpcServerIdleConnectionHandlerTest` 验证 READER_IDLE 关闭当前 Channel；
+- 验证非读空闲用户事件继续向 Pipeline 后方传播；
+- `NettyRpcServerIdleConfigurationTest` 验证自定义 70 秒进入 Netty 服务端；
+- 验证 0 秒读空闲配置在创建线程和绑定端口前被拒绝；
+- `MiniRpcAutoConfigurationTest` 验证 kebab-case 的 70 秒配置正确绑定；
+- 执行 Provider core 与 Starter 共 16 个定向测试，全部通过；
+- Docker 启动后再次执行根工程 `mvn test`，core 50 个测试全部通过，
+  包含真实 ZooKeeper + Netty 的 Testcontainers 用例；Starter 12 个测试全部
+  通过，六个 Maven 模块构建成功。
+
+#### 当前限制与下一步
+
+- Consumer 与 Provider 空闲参数需要部署者自行协调，协议尚未协商心跳能力；
+- Provider 关闭静默 Channel 时只记录日志，没有持续的活跃连接数和断线指标；
+- 已经进入业务线程的用户代码不会因 Channel 关闭而自动取消；
+- 当前测试分别验证编解码、空闲事件和 Handler 行为，尚缺真实 Netty 连接下的
+  “空闲 → 关闭 → 下一次调用重连”集成测试；
+- 下一步建议实现 S5-I-D：使用短心跳参数和真实 Netty Channel 编写无需
+  ZooKeeper 的连接生命周期集成测试，再开始设计有限重试。
+
+### 3.35 Consumer 示例开启心跳 DEBUG 日志
+
+- 日期：2026-10-25
+- 对应提交：本次 Provider 连接清理与心跳可观察性阶段提交
+- 状态：已实现并验证
+
+#### 目标
+
+让学习者运行 Consumer 示例时，可以直接在控制台观察自动发送 PING 与
+收到 PONG 的过程，无需把整个应用或 Netty 的日志级别调为 DEBUG。
+
+#### 主要修改
+
+- 在 Consumer 示例 `application.yml` 中将
+  `com.itheima.transport.client` 日志级别设为 `DEBUG`；
+- 在 README 中说明该配置只用于示例观察，不是 Starter 强制的
+  全局日志策略。
+
+#### 行为变化
+
+Consumer 完成首次 RPC 调用并建立 Channel 后，如果连续 15 秒没有写业务
+数据，控制台现在会输出“发送 PING”；Provider 回复后会输出“收到
+PONG”。心跳发送频率、协议和连接生命周期都没有变化。
+
+#### 设计原因
+
+- 只打开 mini-RPC Consumer 传输包，避免 Spring、ZooKeeper 和 Netty 内部
+  DEBUG 日志淹没心跳主线；
+- 保留框架代码中正常心跳的 DEBUG 级别，避免真实项目在 INFO 级别下
+  每隔数秒输出两条日志；
+- 把可观察性选择放在示例应用，不让 Starter 擅自修改业务应用的
+  日志策略。
+
+#### 验证方式
+
+- 检查 YAML 层级为 `logging.level.com.itheima.transport.client: DEBUG`；
+- 启动 Provider 和 Consumer，完成一次 RPC 调用并等待一个
+  `heartbeat-interval`，实际观察到约 15 秒和 30 秒时分别完成
+  requestId 为 1、2 的 PING/PONG 往返；
+- 执行 `mvn -q -pl mini-rpc-example-consumer -am -DskipTests package`，
+  Consumer 及其依赖模块构建成功；
+- 本次只修改示例日志配置和文档，不修改 Java 调用链。
+
+#### 当前限制与下一步
+
+- 只有已建立的 Channel 会进入写空闲计时，启动 Consumer 但从未调用
+  Provider 时不会出现心跳日志；
+- Provider 正常回复 PONG 暂时没有独立日志，但 Consumer 收到 PONG 已能
+  证明完整往返链路；
+- 下一步仍建议实现 S5-I-D 真实 Netty 心跳生命周期集成测试。

@@ -67,6 +67,7 @@ JDK 动态代理
 | S5-I-A | 心跳消息编解码与被动 PING/PONG | 已完成 |
 | S5-I-B-A | Consumer 写空闲心跳与读空闲断连 | 已完成 |
 | S5-I-B-B | Consumer 心跳时间 Starter 配置化 | 已完成 |
+| S5-I-C | Provider 静默客户端 Channel 清理 | 已完成 |
 | M5 | SPI、重试、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -178,6 +179,7 @@ mini-rpc:
   heartbeat-interval: 15s
   heartbeat-timeout: 45s
   shutdown-timeout: 10s
+  provider-client-idle-timeout: 60s
   serializer: json
   load-balance: round-robin
   provider-enabled: false
@@ -211,6 +213,20 @@ mini-rpc:
 
 这两个值属于整个 Consumer Netty 客户端，而不是某个 `@RpcReference`。不同远程
 引用共享 Channel，因此也共享同一套连接存活判断。
+
+Consumer 示例默认将 `com.itheima.transport.client` 日志调为 `DEBUG`，
+便于在控制台观察写空闲后发送 PING 和收到 PONG。这只是示例应用的
+观察配置，不是 Starter 强制的日志级别；实际应用可按需移除或改为
+`INFO`：
+
+```yaml
+logging:
+  level:
+    com.itheima.transport.client: DEBUG
+```
+
+必须先发起一次 RPC 调用建立 Channel，之后写空闲计时器才会开始工作；
+仅启动 Consumer 但没有连接 Provider 时，不会产生心跳日志。
 
 Netty 客户端真正发送请求前，还会把本次最终采用的超时换算成绝对 deadline，并
 写入 `RpcRequest.deadlineEpochMillis`。Provider 会在查找服务和反射调用之前检查
@@ -249,6 +265,11 @@ I/O 线程退化成业务线程，也不会用无界队列持续占用内存。�
 请求数、发起 Netty worker 的立即关闭并继续返回。它和 Consumer 的
 `request-timeout` 是两个不同方向的时间限制，前者管理服务关闭，后者管理客户端
 等待响应。
+
+`provider-client-idle-timeout` 控制 Provider 连续多久没有从某条客户端 Channel
+读到普通请求或 PING 后关闭该连接，默认 60 秒，必须至少为 1 毫秒。这个值属于
+Provider，无法自动读取另一台 Consumer 的 `heartbeat-interval`，部署时应保证它
+明显大于 Consumer 心跳间隔，例如 Consumer 15 秒、Provider 60 秒。
 
 `serializer` 决定本应用发送 RPC 正文时使用的编码方式，可选 `json`（默认）或
 `jdk`。Consumer 用它编码请求，Provider 用它编码响应；接收方根据 20 字节协议头
@@ -848,6 +869,10 @@ PendingRequestManager.failAll(...)
 三倍，用于容忍短暂抖动。空闲定时任务由每条 Channel 所属的 EventLoop 调度，
 框架没有为心跳再创建线程池。
 
+Provider 也会为每条已接受的客户端 Channel 安装独立读空闲检测。普通请求和 PING
+都会证明客户端仍然存活；如果默认 60 秒内没有收到任何入站数据，Provider 只关闭
+这条静默子 Channel，不会关闭监听端口、其他客户端连接或业务线程池。
+
 ---
 
 ## 9. 本地运行
@@ -1007,9 +1032,9 @@ mini-rpc-example-consumer
 1. 服务发现已有本地缓存和一次性 ZooKeeper Watch，但当前是“变化后失效、下次
    调用再查询”，尚未在后台主动构建最新地址快照；
 2. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
-3. Consumer 心跳间隔和读空闲超时已支持 Starter 全局配置，但还不能按单个
-   `@RpcReference` 覆盖；Provider 侧也尚未主动清理长期不发送任何数据的客户端
-   连接；
+3. Consumer 和 Provider 的空闲时间都已支持 Starter 全局配置，但还不能按服务或
+   单个 `@RpcReference` 覆盖；两端属于不同进程，Provider 阈值与 Consumer 心跳
+   间隔目前需要部署者自行协调；
 4. 暂无失败重试、熔断、限流和降级；
 5. 当前只内置 JSON、JDK 两种序列化方式和轮询、随机两种负载均衡策略；还没有
    SPI、权重、最少活跃或一致性哈希等扩展；
@@ -1030,8 +1055,8 @@ mini-rpc-example-consumer
 
 Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 为 Provider 增加客户端读空闲清理，避免 Consumer 进程异常退出或网络静默
-   断开后长期保留半开 Channel；
+1. 为心跳与断线重连补充真实 Netty 集成测试，验证空闲事件、Channel 关闭和下一次
+   调用重连的完整链路；
 2. 再逐步加入有限重试、SPI 和更多策略配置；
 3. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
    执行前检查与协作式检查，因此暂缓到确有需求时再实现，避免过度设计。

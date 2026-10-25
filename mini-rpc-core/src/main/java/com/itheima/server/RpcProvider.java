@@ -162,10 +162,10 @@ public final class RpcProvider implements AutoCloseable {
     }
 
     /**
-     * 使用完整的 Provider 网络、关闭和业务线程池配置创建实例。
+     * 使用 Provider 网络、关闭和业务线程池配置创建实例。
      *
-     * <p>Starter 通过这个构造方法把 application.yml 中的线程数和队列容量传到
-     * Netty 服务端；业务应用仍然不需要手动创建线程池。</p>
+     * <p>该兼容构造方法继续使用默认客户端读空闲时间；需要覆盖静默连接清理时间
+     * 时使用下面的完整构造方法。</p>
      */
     public RpcProvider(
             String host,
@@ -173,6 +173,34 @@ public final class RpcProvider implements AutoCloseable {
             String zooKeeperAddress,
             Serializer serializer,
             Duration shutdownTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
+    ) {
+        this(
+                host,
+                port,
+                zooKeeperAddress,
+                serializer,
+                shutdownTimeout,
+                NettyRpcServer.DEFAULT_CLIENT_IDLE_TIMEOUT,
+                businessThreadCount,
+                businessQueueCapacity
+        );
+    }
+
+    /**
+     * 使用完整的 Provider 网络、关闭、静默连接和业务线程池配置创建实例。
+     *
+     * <p>Spring Boot Starter 使用这个构造方法。旧构造方法继续委托到这里并使用
+     * 默认客户端读空闲时间，保持非 Spring 教学入口兼容。</p>
+     */
+    public RpcProvider(
+            String host,
+            int port,
+            String zooKeeperAddress,
+            Serializer serializer,
+            Duration shutdownTimeout,
+            Duration clientIdleTimeout,
             int businessThreadCount,
             int businessQueueCapacity
     ) {
@@ -186,6 +214,7 @@ public final class RpcProvider implements AutoCloseable {
                 serializer,
                 requestHandler,
                 shutdownTimeout,
+                clientIdleTimeout,
                 businessThreadCount,
                 businessQueueCapacity
         );

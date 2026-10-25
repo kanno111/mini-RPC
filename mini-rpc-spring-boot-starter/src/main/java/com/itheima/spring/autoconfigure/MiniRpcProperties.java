@@ -19,6 +19,7 @@ import java.time.Duration;
  *   heartbeat-interval: 15s
  *   heartbeat-timeout: 45s
  *   shutdown-timeout: 10s
+ *   provider-client-idle-timeout: 60s
  *   serializer: json
  *   load-balance: round-robin
  *   provider-enabled: false
@@ -56,6 +57,10 @@ public class MiniRpcProperties {
 
     /** Provider 关闭时等待在途请求完成的最长时间。 */
     private Duration shutdownTimeout = Duration.ofSeconds(10);
+
+    /** Provider 连续多久没有收到客户端数据后关闭对应 Channel。 */
+    private Duration providerClientIdleTimeout =
+            NettyRpcServer.DEFAULT_CLIENT_IDLE_TIMEOUT;
 
     /** 本端发送 RPC 正文时使用的序列化方式，默认继续使用 JSON。 */
     private SerializerType serializer = SerializerType.JSON;
@@ -126,6 +131,16 @@ public class MiniRpcProperties {
 
     public void setShutdownTimeout(Duration shutdownTimeout) {
         this.shutdownTimeout = shutdownTimeout;
+    }
+
+    public Duration getProviderClientIdleTimeout() {
+        return providerClientIdleTimeout;
+    }
+
+    public void setProviderClientIdleTimeout(
+            Duration providerClientIdleTimeout
+    ) {
+        this.providerClientIdleTimeout = providerClientIdleTimeout;
     }
 
     public SerializerType getSerializer() {

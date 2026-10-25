@@ -56,6 +56,7 @@ class MiniRpcAutoConfigurationTest {
                         "mini-rpc.heartbeat-interval=7s",
                         "mini-rpc.heartbeat-timeout=21s",
                         "mini-rpc.shutdown-timeout=12s",
+                        "mini-rpc.provider-client-idle-timeout=70s",
                         "mini-rpc.serializer=jdk",
                         "mini-rpc.load-balance=random",
                         "mini-rpc.server-port=9090",
@@ -79,6 +80,8 @@ class MiniRpcAutoConfigurationTest {
                             .isEqualTo(Duration.ofSeconds(21));
                     assertThat(properties.getShutdownTimeout())
                             .isEqualTo(Duration.ofSeconds(12));
+                    assertThat(properties.getProviderClientIdleTimeout())
+                            .isEqualTo(Duration.ofSeconds(70));
                     assertThat(properties.getSerializer())
                             .isEqualTo(
                                     MiniRpcProperties.SerializerType.JDK

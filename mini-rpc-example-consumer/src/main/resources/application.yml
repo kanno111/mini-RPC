@@ -13,3 +13,8 @@ mini-rpc:
   # 连接写空闲 15 秒时发送 PING；45 秒没有收到任何数据时关闭连接。
   heartbeat-interval: 15s
   heartbeat-timeout: 45s
+
+logging:
+  level:
+    # 只打开 mini-RPC Consumer 传输层的 DEBUG，用于观察 PING/PONG，避免输出大量 Netty 内部日志。
+    com.itheima.transport.client: DEBUG

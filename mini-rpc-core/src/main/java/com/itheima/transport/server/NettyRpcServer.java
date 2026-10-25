@@ -14,6 +14,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.timeout.IdleStateHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,10 +35,10 @@ import java.util.concurrent.TimeUnit;
  *      ↓
  * 每条连接自己的 Pipeline
  *      ↓
- * RpcDecoder → RpcEncoder → 心跳 Handler → NettyRpcServerHandler
- *                        ↓                      ↓
- *                 PING 直接回复 PONG
- *                                               ↓
+ * IdleStateHandler → RpcDecoder → RpcEncoder → 空闲清理 → 心跳 → 业务 Handler
+ *        ↓                                      ↓        ↓          ↓
+ *  静默连接计时                         只关当前 Channel  PONG   提交业务池
+ *                                                                  ↓
  * ProviderBusinessExecutor：执行服务查找和业务方法
  * </pre>
  */
@@ -48,6 +49,10 @@ public class NettyRpcServer implements RpcServer {
     /** Provider 默认最多等待 10 秒，让关闭前已经开始的请求完成响应。 */
     public static final Duration DEFAULT_SHUTDOWN_TIMEOUT =
             Duration.ofSeconds(10);
+
+    /** Provider 默认 60 秒没有收到客户端数据就关闭对应的静默 Channel。 */
+    public static final Duration DEFAULT_CLIENT_IDLE_TIMEOUT =
+            Duration.ofSeconds(60);
 
     /** 默认业务线程数：至少 2 个，并随运行机器的可用处理器数量增加。 */
     public static final int DEFAULT_BUSINESS_THREAD_COUNT = Math.max(
@@ -71,8 +76,15 @@ public class NettyRpcServer implements RpcServer {
     private final NettyRpcServerHeartbeatHandler heartbeatHandler =
             new NettyRpcServerHeartbeatHandler();
 
+    /** 所有客户端连接共享的无状态读空闲事件处理器。 */
+    private final NettyRpcServerIdleConnectionHandler idleConnectionHandler =
+            new NettyRpcServerIdleConnectionHandler();
+
     /** 关闭时等待在途请求完成的最长时间。 */
     private final Duration shutdownTimeout;
+
+    /** 单条客户端 Channel 允许连续没有入站数据的最长毫秒数。 */
+    private final long clientIdleTimeoutMillis;
 
     /** 服务端和业务 Handler 共享的在途请求计数器。 */
     private final InFlightRequestTracker requestTracker;
@@ -102,7 +114,7 @@ public class NettyRpcServer implements RpcServer {
      * 创建 Netty RPC 服务端。
      *
      * @param port           监听端口，范围是 1 到 65535
-     * @param serializer     请求和响应使用的序列化器
+     * @param serializer     请求、响应和心跳使用的序列化器
      * @param requestHandler 负责查找服务并执行方法的请求处理器
      */
     public NettyRpcServer(
@@ -115,6 +127,7 @@ public class NettyRpcServer implements RpcServer {
                 serializer,
                 requestHandler,
                 DEFAULT_SHUTDOWN_TIMEOUT,
+                DEFAULT_CLIENT_IDLE_TIMEOUT,
                 DEFAULT_BUSINESS_THREAD_COUNT,
                 DEFAULT_BUSINESS_QUEUE_CAPACITY
         );
@@ -136,6 +149,7 @@ public class NettyRpcServer implements RpcServer {
                 serializer,
                 requestHandler,
                 shutdownTimeout,
+                DEFAULT_CLIENT_IDLE_TIMEOUT,
                 DEFAULT_BUSINESS_THREAD_COUNT,
                 DEFAULT_BUSINESS_QUEUE_CAPACITY
         );
@@ -155,6 +169,31 @@ public class NettyRpcServer implements RpcServer {
             int businessThreadCount,
             int businessQueueCapacity
     ) {
+        this(
+                port,
+                serializer,
+                requestHandler,
+                shutdownTimeout,
+                DEFAULT_CLIENT_IDLE_TIMEOUT,
+                businessThreadCount,
+                businessQueueCapacity
+        );
+    }
+
+    /**
+     * 创建包含关闭排空、客户端读空闲和业务线程池参数的 Netty 服务端。
+     *
+     * @param clientIdleTimeout 单条客户端连接连续多久没有入站数据后关闭
+     */
+    public NettyRpcServer(
+            int port,
+            Serializer serializer,
+            RpcRequestHandler requestHandler,
+            Duration shutdownTimeout,
+            Duration clientIdleTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
+    ) {
         if (port < 1 || port > 65535) {
             throw new RpcException("RPC 服务端端口必须在 1 到 65535 之间：" + port);
         }
@@ -165,6 +204,9 @@ public class NettyRpcServer implements RpcServer {
             throw new RpcException("RpcRequestHandler 不能为空");
         }
         validateShutdownTimeout(shutdownTimeout);
+        this.clientIdleTimeoutMillis = validateClientIdleTimeout(
+                clientIdleTimeout
+        );
 
         this.port = port;
         this.serializer = serializer;
@@ -293,10 +335,23 @@ public class NettyRpcServer implements RpcServer {
      */
     private void configurePipeline(SocketChannel channel) {
         channel.pipeline()
+                /*
+                 * IdleStateHandler 保存某一条 Channel 的最后读取时间，不能跨连接
+                 * 共享。只启用 readerIdle：Provider 不主动发 PING，也不需要观察
+                 * 自己是否长期没有写数据。
+                 */
+                .addLast(new IdleStateHandler(
+                        clientIdleTimeoutMillis,
+                        0L,
+                        0L,
+                        TimeUnit.MILLISECONDS
+                ))
                 // 入站：等待完整协议帧，并按消息类型还原请求或心跳。
                 .addLast(new RpcDecoder())
                 // 出站：把响应或心跳编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
+                // 入站：读空闲时只关闭当前静默客户端 Channel。
+                .addLast(idleConnectionHandler)
                 // 入站：PING 在 EventLoop 中直接回复 PONG，不进入业务线程池。
                 .addLast(heartbeatHandler)
                 // 入站：把请求分发到业务线程池，完成后再写回响应。
@@ -395,5 +450,34 @@ public class NettyRpcServer implements RpcServer {
                 || timeout.toMillis() < 1) {
             throw new RpcException("Provider 排空超时不能小于 1 毫秒");
         }
+    }
+
+    /** 在创建线程池和 EventLoop 前拒绝无效的客户端读空闲时间。 */
+    private long validateClientIdleTimeout(Duration timeout) {
+        if (timeout == null) {
+            throw new RpcException("Provider 客户端读空闲超时不能为空");
+        }
+
+        final long timeoutMillis;
+        try {
+            timeoutMillis = timeout.toMillis();
+        } catch (ArithmeticException exception) {
+            throw new RpcException(
+                    "Provider 客户端读空闲超时过大",
+                    exception
+            );
+        }
+
+        if (timeoutMillis <= 0) {
+            throw new RpcException(
+                    "Provider 客户端读空闲超时不能小于 1 毫秒"
+            );
+        }
+        return timeoutMillis;
+    }
+
+    /** 返回当前真正安装到每条客户端 Channel 的读空闲超时。 */
+    public Duration getClientIdleTimeout() {
+        return Duration.ofMillis(clientIdleTimeoutMillis);
     }
 }

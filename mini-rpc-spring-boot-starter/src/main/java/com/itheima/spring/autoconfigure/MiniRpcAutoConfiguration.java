@@ -176,6 +176,7 @@ public class MiniRpcAutoConfiguration {
                 properties.getRegistryAddress(),
                 serializer,
                 properties.getShutdownTimeout(),
+                properties.getProviderClientIdleTimeout(),
                 properties.getProviderBusinessThreads(),
                 properties.getProviderBusinessQueueCapacity()
         );
