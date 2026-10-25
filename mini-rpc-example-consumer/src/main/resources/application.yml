@@ -17,4 +17,4 @@ mini-rpc:
 logging:
   level:
     # 只打开 mini-RPC Consumer 传输层的 DEBUG，用于观察 PING/PONG，避免输出大量 Netty 内部日志。
-    com.itheima.transport.client: DEBUG
+    io.github.kaano.minirpc.transport.client: DEBUG

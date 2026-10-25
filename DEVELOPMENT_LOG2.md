@@ -525,7 +525,7 @@ NettyRpcServerIdleConnectionHandler
 #### 主要修改
 
 - 在 Consumer 示例 `application.yml` 中将
-  `com.itheima.transport.client` 日志级别设为 `DEBUG`；
+  `io.github.kaano.minirpc.transport.client` 日志级别设为 `DEBUG`；
 - 在 README 中说明该配置只用于示例观察，不是 Starter 强制的
   全局日志策略。
 
@@ -546,7 +546,7 @@ PONG”。心跳发送频率、协议和连接生命周期都没有变化。
 
 #### 验证方式
 
-- 检查 YAML 层级为 `logging.level.com.itheima.transport.client: DEBUG`；
+- 检查 YAML 层级为 `logging.level.io.github.kaano.minirpc.transport.client: DEBUG`；
 - 启动 Provider 和 Consumer，完成一次 RPC 调用并等待一个
   `heartbeat-interval`，实际观察到约 15 秒和 30 秒时分别完成
   requestId 为 1、2 的 PING/PONG 往返；
@@ -720,3 +720,437 @@ Channel-2 通过 PING/PONG 持续存活
 - 框架仍没有“失败后自动重试当前 RPC”，这与连接重建是两个不同概念；
 - 下一步建议进入 M5-A：先定义只针对“明确未到达 Provider”失败的
   有限重试边界，避免非幂等业务被重复执行。
+
+### 3.38 生产成熟度与主流 RPC 框架差距评估
+
+- 日期：2026-10-25
+- 评估基线：3.37 / S5-I-D-B，对应提交 `8cb35ed`
+- 状态：文档已完成
+
+#### 目标
+
+在已经完成真实 Netty 心跳生命周期测试的基础上，独立评估 mini-RPC
+与通用生产级 RPC 框架的差距。文档要明确区分“已经完成核心调用链”
+和“已经达到生产级”，避免因功能列表较长而高估工程成熟度。
+
+#### 主要修改
+
+- 根目录新增 `PRODUCTION_READINESS_GAP.md`；
+- 文档顶部明确标注评估基于 `DEVELOPMENT_LOG2.md` 3.37 / S5-I-D-B，
+  并记录提交和测试基线；
+- 从 Spring 使用体验、服务模型、协议契约、发现路由、可靠性、
+  可观测性、安全、扩展性、云原生和工程验证等维度逐项对照；
+- 补充 mini-RPC、Dubbo 类框架和 gRPC 类框架的直接对照表；
+- 对每个主要缺口说明当前状态、生产风险、建议和部分验收条件；
+- 给出面向简历项目的推荐路线：版本路由、Filter 调用链、Metrics、
+  最小 SPI、CI 与性能基线；
+- 单独记录不建议当前立即实现的能力，包括透明业务重试、完整
+  流式 RPC、跨语言 IDL、控制台和自研容错算法库；
+- 在 README 增加评估文档入口，并根据当前的设计判断更新下一步路线。
+
+#### 行为变化
+
+本步只新增评估文档并调整 README 中的文档入口和规划，不修改 Java 代码、
+配置、协议、启动流程或运行行为。
+
+规划上的变化是：不再把透明失败重试作为紧接心跳之后的默认实现目标。
+当前保留“失效 Channel 由下一次业务调用按需重建”，业务调用重试由上层
+根据幂等性显式决定。
+
+#### 设计原因
+
+- Dubbo 与 gRPC 的成熟度来自协议、治理、工具链、运维和长期生态，
+  不能只通过复制几个功能类判断距离；
+- 对简历项目而言，服务版本、统一 Filter、Metrics、最小 SPI 和自动化
+  验证比完整跨语言或控制面更有投入产出比；
+- 生产级结论必须有指标、性能、弱网、长稳、安全和兼容验证支撑，
+  不能只根据正常路径测试推断；
+- 文档中同时列出“不建议实现”的范围，防止项目为追求功能数量而
+  过度设计。
+
+#### 验证方式
+
+- 检查评估文档顶部已明确标注 3.37 / S5-I-D-B 基线；
+- 检查 README 中的相对链接可以指向根目录新文档；
+- 检查文档同时包含当前能力、差距矩阵、详细风险、演进顺序、
+  生产检查表和简历表述边界；
+- 对本次 Markdown 改动执行 `git diff --check`；
+- 本步不修改运行代码，因此不重复执行 Java 测试。
+
+#### 当前限制与下一步
+
+- 成熟度百分比只是用于表达相对位置的粗略判断，不是性能或功能数量的
+  精确数学计算；
+- 本文评估的是 3.37 阶段，后续能力变化时应增加新基线，不能静默改变原有
+  阶段结论；
+- 如继续开发，下一个推荐小步骤是定义统一 `ServiceKey`，让已有
+  `RpcRequest.version` 开始参与 Provider 本地服务查找，暂不同时修改 ZooKeeper 路径。
+
+### 3.39 项目命名空间迁移到 kaano
+
+- 日期：2026-10-25
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+移除早期教学项目留下的 `com.itheima` 命名空间，改用项目维护者
+`kaano` 的 GitHub 命名空间，让 Java 包名、Maven 坐标、Spring Boot 自动配置
+入口和文档示例保持一致。
+
+#### 主要修改
+
+- Maven `groupId` 从 `com.itheima` 改为 `io.github.kaano`；
+- Java 基础包从 `com.itheima` 改为 `io.github.kaano.minirpc`；
+- 迁移 core、Starter、example-api、example-provider、example-consumer 的所有
+  main/test Java 源码目录；
+- 机械替换所有 Java `package`、`import`、注解类名和测试中的接口全限定名；
+- Spring Boot `AutoConfiguration.imports` 改为新自动配置类名；
+- Consumer 心跳 DEBUG 日志包名改为
+  `io.github.kaano.minirpc.transport.client`；
+- README、开发记录和原始规划中的代码示例同步更新；
+- README 增加 Maven 坐标、Java 基础包和升级兼容性说明。
+
+#### 行为变化
+
+RPC 网络协议、线程模型、心跳、超时和服务治理行为本身不变，但这次是
+一次源码和服务身份不兼容迁移：
+
+- 业务代码必须把旧 Java import 改为 `io.github.kaano.minirpc...`；
+- Maven 依赖坐标必须改为 `io.github.kaano:*`；
+- 当前 ZooKeeper 服务名包含 Java 接口全限定名，因此新包名 Provider 不会与
+  旧包名 Consumer 直接互通；
+- Provider、Consumer 和共享 API 应一起重新构建和启动，旧 ZooKeeper 临时
+  节点会随旧 Provider 会话关闭而消失。
+
+#### 设计原因
+
+- `io.github.<username>` 是个人 GitHub 项目常见的反向域名命名方式；
+- Maven 坐标与 Java 包名分开：坐标使用 `io.github.kaano`，包名再增加
+  `minirpc` 避免与用户名下的其他项目冲突；
+- 同步迁移生产代码、测试、示例和自动配置资源，防止“编译成功但
+  Starter 无法发现自动配置”这类运行期遗漏；
+- 包名迁移是一次明确的断式更名，不保留双包兼容类，避免长期维护
+  两份公开 API。
+
+#### 验证方式
+
+- 搜索所有源码、POM、资源和文档：除本节用于解释迁移的旧名称外，运行文件
+  不再引用 `com.itheima`；
+- 83 个 Java 文件均已使用 `io.github.kaano.minirpc` 包声明，七个 main/test
+  Java 源码根均已迁移到 `io/github/kaano/minirpc`；
+- 先执行 `mvn clean test`，确认旧 `target` 被删除、core 的 47 个生产类和
+  22 个测试类能够从新路径重新编译；首次测试中 Mockito 尝试通过外部进程
+  挂载 Agent，该外部 JVM 因本机可用内存不足而中止，该错误与包名迁移无关；
+- 使用
+  `mvn test -DargLine="-Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading"`
+  复跑完整 Reactor：core 52 个测试、Starter 12 个测试全部通过，0 失败、
+  0 错误，六个 Maven 模块全部构建成功；
+- Spring Boot 自动配置测试和真实 Netty 心跳、Testcontainers 端到端测试均在
+  新命名空间下通过；
+- 执行 `git diff --check` 检查迁移后的空白错误。
+
+#### 当前限制与下一步
+
+- 这次不提供旧 `com.itheima` 公开 API 的兼容层；
+- 如果已经有外部项目依赖旧坐标，需要同步修改 POM 和 import；
+- 当前机器直接执行 Mockito 测试时，外部 Agent 挂载进程可能受可用内存影响；
+  本次通过允许测试 JVM 自挂载完成验证，不把 Mockito 构建配置调整混入包名迁移；
+- 下一步仍建议定义统一 `ServiceKey`，先让 version 参与 Provider 本地服务查找。
+
+### 3.40 R1-A：ServiceKey 与 Provider 本地版本/分组路由
+
+- 日期：2026-10-25
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+开始服务版本与分组路由的第一步：先建立统一服务身份，让 Provider 本地服务表
+能够区分同一个 Java 接口下的不同 group/version 实现。本步不同时修改 ZooKeeper
+路径、注解和 Consumer 地址缓存，避免一次改动跨越全部注册发现链路。
+
+#### 主要修改
+
+- 新增不可变 `ServiceKey`，由 `interfaceName + group + version` 组成；
+- 统一默认值：`group=default`、`version=1.0`；
+- `RpcRequest` 新增 group 字段，已有 version 字段开始参与 Provider 本地查找；
+- `ServiceProvider` 增加基于完整 `ServiceKey` 的注册、查询和移除方法，旧接口名方法
+  保留为默认路由的兼容入口；
+- `DefaultServiceProvider` 的本地表从 `Map<String, Object>` 改为
+  `Map<ServiceKey, Object>`；
+- `RpcRequestHandler` 根据请求构造 ServiceKey 后精确查找实现；
+- `RpcClientProxy` 当前显式发送默认 group，已有 version 继续随请求发送；
+- `RpcProvider` 增加显式 group/version 的注册重载，原注册方法继续使用默认路由；
+- 新增 `ServiceVersionGroupRoutingTest`，覆盖同接口三种路由、旧请求默认值、精确
+  重复注册拒绝和不存在路由失败；
+- JSON、JDK 请求序列化测试增加 group/version 往返断言；
+- README 同步说明新的本地服务表结构和当前边界。
+
+#### 行为变化与调用链
+
+过去 Provider 本地服务表只有：
+
+```text
+interfaceName → service
+```
+
+现在变为：
+
+```text
+RpcRequest(interfaceName, group, version)
+        ↓
+ServiceKey.fromRequest(...)
+        ↓
+Map<ServiceKey, Object>
+        ↓
+精确服务实现
+```
+
+因此同一个接口的 `default/1.0`、`default/2.0` 和 `gray/2.0` 可以在同一个
+Provider JVM 中同时注册，不再互相覆盖。请求没有 group/version 时，为兼容旧
+Consumer，会自动使用 `default/1.0`；显式空字符串仍会被拒绝，不会悄悄降级。
+
+#### 设计原因
+
+- 使用不可变值对象集中表达服务身份，避免注册中心、服务表和缓存分别拼接字符串；
+- ServiceKey 只保存接口名称而不保存 `Class<?>`，便于后续进入网络请求、ZooKeeper
+  路径和缓存键，也减少类加载器耦合；
+- 注册时仍额外接收接口类型，用于验证实现对象确实实现了公开契约；
+- 旧请求只对缺失字段使用默认值，显式空值视为配置错误，防止错误流量落到默认实现；
+- 当前注册中心仍按接口名发布，先证明 Provider 本地查找正确，再单独修改分布式
+  注册发现语义，降低排查范围。
+
+#### 验证方式
+
+- 执行 core 定向测试：`ServiceVersionGroupRoutingTest`、
+  `RpcRequestHandlerDeadlineTest`、`RpcRequestDeadlineSerializationTest` 和
+  `RpcProviderStartupOrderTest`；
+- 定向测试通过，证明新路由、旧请求兼容、deadline 和 Provider 启动顺序可以共存；
+- 使用
+  `mvn test -DargLine="-Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading"`
+  执行根工程完整回归：core 56 个测试、Starter 12 个测试全部通过，0 失败、
+  0 错误；
+- 真实 ZooKeeper + Netty 端到端测试、两条真实 Netty 心跳测试均通过，六个 Maven
+  模块全部构建成功。
+
+#### 当前限制与下一步
+
+- `@RpcService` 和 `@RpcReference` 暂时还没有 group/version 属性，Spring 业务代码
+  当前只能使用默认路由；
+- ZooKeeper 注册、发现、缓存和 Watch 仍按接口全限定名工作，不能把只部署某个版本
+  的 Provider 地址提前过滤掉；
+- 因此本阶段只能称为“Provider 本地版本/分组路由”，还不是完整分布式路由；
+- 下一步建议实施 R1-B：给两端注解和代理创建链路增加 group/version，让 Spring
+  使用方式能够显式选择服务身份，但仍先保持注册中心路径不变并清楚标注限制。
+
+### 3.41 R1-B：Spring 注解传递服务版本与分组
+
+- 日期：2026-10-25
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+把 R1-A 已经建立的本地 `ServiceKey` 接到最终的 Spring Boot 使用入口，使 Provider
+可以通过 `@RpcService` 声明 group/version，Consumer 可以通过 `@RpcReference`
+选择同一个服务身份。业务代码仍不需要手动创建代理、Netty 或注册中心组件。
+
+#### 主要修改
+
+- `@RpcService` 新增 `group`、`version` 属性，默认值为 `default/1.0`；
+- `@RpcReference` 新增相同属性，同时保留已有 `timeoutMillis`；
+- `RpcProvider.registerService(Object)` 读取服务注解中的完整路由信息；
+- `SpringRpcProviderLifecycle` 把服务注解的 group/version 传入 RpcProvider；
+- `RpcClientProxy` 新增 group 字段和完整路由构造方法，旧构造方法继续委托到
+  默认 group，保持原有 core 调用兼容；
+- `RpcClientFactory` 新增按 group/version 和可选单引用超时创建代理的重载；
+- `RpcReferenceInjector` 同时传递接口、group、version、timeout，并在创建任何
+  代理前用 ServiceKey 规则校验路由值；
+- 扩展 Consumer 单元测试，验证默认路由、自定义 `gray/2.0`、单引用超时和空
+  group 拒绝；
+- 新增 `SpringRpcProviderLifecycleRoutingTest`，验证 Spring Provider 注册时不会
+  丢失服务注解中的 group/version；
+- README 增加两端注解示例，并同步当前限制与下一步。
+
+#### 行为变化与调用链
+
+业务代码现在可以声明：
+
+```java
+@RpcService(
+        serviceInterface = HelloService.class,
+        group = "gray",
+        version = "2.0"
+)
+
+@RpcReference(group = "gray", version = "2.0")
+private HelloService helloService;
+```
+
+Consumer 调用链：
+
+```text
+@RpcReference(group, version, timeout)
+        ↓ RpcReferenceInjector
+RpcClientFactory.createProxy(...)
+        ↓ RpcClientProxy
+RpcRequest(group, version)
+        ↓ Netty
+Provider ServiceKey 精确查找
+```
+
+Provider 启动链：
+
+```text
+@RpcService(group, version)
+        ↓ SpringRpcProviderLifecycle
+RpcProvider.registerService(...)
+        ↓
+Map<ServiceKey, Object>
+```
+
+省略属性时保持原有 `default/1.0` 行为；两端显式值不一致时，Provider 本地查找
+不到对应实现并返回失败，不会自动回退到其他版本。
+
+#### 设计原因
+
+- group/version 属于单个服务引用，而不是整个 Consumer 的全局配置，因此放在注解
+  和轻量代理中，不放进 `MiniRpcProperties`；
+- 保留 RpcClientProxy 和 RpcClientFactory 的旧方法，避免教学入口及已有测试被迫
+  一次性迁移；
+- 注入器先校验所有字段再创建代理，任何错误都不会让一个 Bean 只完成一半注入；
+- Provider 与 Consumer 使用同一组 ServiceKey 默认值，避免两端各自维护字符串；
+- 本步继续不修改 ZooKeeper，把“注解参数传递错误”和“分布式路径设计错误”分开
+  验证。
+
+#### 验证方式
+
+- 执行 `RpcReferenceInjectorTimeoutTest`、`RpcClientProxyTimeoutTest`、
+  `ServiceVersionGroupRoutingTest` 和 `SpringRpcProviderLifecycleRoutingTest`；
+- 定向测试通过，证明 Consumer 注解、请求对象、Provider 注解和本地服务表之间的
+  路由参数能够完整传递；
+- 首次完整测试在 Surefire 测试 JVM 启动阶段因本机可用提交内存不足而退出，尚未
+  执行测试用例；生产类和测试类编译均已成功，该问题不是代码断言失败；
+- 使用
+  `mvn test -DargLine="-Xms64m -Xmx384m -XX:MaxMetaspaceSize=256m -Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading"`
+  限制测试 JVM 内存后完整回归通过：core 57 个测试、Starter 13 个测试全部通过，
+  0 失败、0 错误；
+- 真实 ZooKeeper + Netty 端到端测试、两条真实 Netty 心跳测试均通过，六个 Maven
+  模块全部构建成功。
+
+#### 当前限制与下一步
+
+- ZooKeeper 仍以接口全限定名作为服务路径，Consumer 发现阶段不能只返回匹配
+  group/version 的 Provider；
+- 当不同 Provider 只部署部分版本时，当前负载均衡仍可能先选中不含目标 ServiceKey
+  的地址，随后由 Provider 返回“服务不存在”；
+- 当前没有通配版本、版本范围或自动降级，Consumer 必须选择一个精确身份；
+- 下一步建议实施 R1-C：设计可安全用于 ZooKeeper 节点的 ServiceKey 路径格式，
+  同步升级注册、发现缓存、Watch 和端到端测试，完成真正的分布式路由。
+
+### 3.42 R1-C：分布式服务版本与分组路由
+
+- 日期：2026-10-25
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+把完整 `ServiceKey` 接入 ZooKeeper 注册发现、Consumer 地址缓存、Watch、负载均衡
+和 Netty 选址，使不同 Provider 分别部署同一接口的不同 group/version 时，Consumer
+在建立连接前就只获得目标版本地址，而不是连接后再由 Provider 拒绝。
+
+#### 主要修改
+
+- `ServiceRegistry`、`ServiceDiscovery`、`ServiceAddressResolver` 和 `LoadBalance`
+  的主接口参数从字符串升级为 `ServiceKey`；
+- 为早期只传接口名的教学代码保留字符串默认方法，自动映射到 `default/1.0`；
+- 新增 `ZooKeeperServicePath`，集中生成和解析注册路径；
+- 新路径使用
+  `/mini-rpc/services/{interface}/{group}/{version}/providers/{address}`；
+- 每个动态路径片段使用 UTF-8 百分号编码，避免斜杠、空格、中文、IPv6 冒号等
+  字符改变 ZooKeeper 层级；
+- `RpcProvider` 从服务名集合升级为 ServiceKey 集合，为每个版本分别发布、记录和
+  主动注销地址；
+- `ZooKeeperServiceDiscovery` 缓存键改为 ServiceKey，Watch 只失效发生变化的版本；
+- `RoundRobinLoadBalance` 按 ServiceKey 维护独立计数器，版本之间不共享轮询进度；
+- `NettyRpcClient` 从请求恢复完整 ServiceKey 后再进行地址解析；
+- 新增路径编码、版本缓存隔离和轮询状态隔离测试；
+- 扩展真实 ZooKeeper + Netty 端到端测试：同时启动 V1、V2 Provider，验证两个
+  Consumer 代理分别发现并调用对应版本；
+- README 同步更新 ZooKeeper 树、调用链、完成状态和当前限制。
+
+#### 行为变化与调用链
+
+注册路径由：
+
+```text
+/mini-rpc/services/{interface}/{address}
+```
+
+变为：
+
+```text
+/mini-rpc/services/{interface}/{group}/{version}/providers/{encoded-address}
+```
+
+完整调用链现在是：
+
+```text
+@RpcReference(group, version)
+        ↓
+RpcRequest(interfaceName, group, version)
+        ↓
+NettyRpcClient 构造 ServiceKey
+        ↓
+ZooKeeperServiceDiscovery 查询该 ServiceKey 的地址目录
+        ↓
+LoadBalance 使用该 ServiceKey 的独立状态选择地址
+        ↓
+目标 Provider 用相同 ServiceKey 查找本地实现
+```
+
+V1 Consumer 不会看到 V2 Provider 地址，V2 Consumer 也不会看到 V1 地址。某个
+版本上下线时，只失效自己的地址缓存，不影响同一接口的其他版本。
+
+#### 设计原因
+
+- 服务身份必须贯穿注册、发现和执行阶段；只在请求到达 Provider 后检查版本会造成
+  错误连接、无效请求和发布期间的随机失败；
+- 路径片段统一编码比禁止所有特殊字符更稳健，也为中文分组和 IPv6 地址留出空间；
+- 增加固定 `providers` 层，使服务身份目录和临时实例目录职责清晰，后续可在版本
+  节点下增加元数据而不与地址节点混淆；
+- Watch 和 TTL 缓存都以 ServiceKey 为粒度，避免 V1 上下线导致 V2 缓存无效；
+- 轮询计数按 ServiceKey 隔离，避免不同版本的调用节奏互相影响；
+- 保留字符串默认入口只用于源码兼容，不让框架内部继续退化为接口名路由。
+
+#### 验证方式
+
+- 执行 `ZooKeeperServicePathTest`，验证 group 中的斜杠、version 中的空格和 IPv6
+  地址可以安全编码并恢复；
+- 执行 `ZooKeeperServiceDiscoveryTest`，验证缓存复用、Watch 失效和不同版本缓存
+  彼此独立；
+- 执行 `RoundRobinLoadBalanceServiceKeyTest`，验证 V1、V2 分别从自己的轮询下标
+  开始；
+- 执行真实 `RpcEndToEndIntegrationTest`：V1、V2 Provider 使用不同端口和路径，
+  V1/V2 代理分别返回 `v1:mini-RPC` 与 `v2:mini-RPC`；
+- core 定向测试通过；
+- 首次完整测试启动时，Maven JVM 因本机 Windows 页面文件不足而无法保留默认
+  G1 内存区域，尚未进入项目编译或测试；
+- 使用本次命令级 `MAVEN_OPTS=-Xms64m -Xmx384m -XX:MaxMetaspaceSize=256m`，并为
+  Surefire 设置相同内存上限及 JDK 21 动态 Agent 参数后完整回归通过；这些参数
+  没有写入项目配置；
+- core 62 个测试、Starter 13 个测试全部通过，共 75 个测试，0 失败、0 错误；
+- 两条真实 Netty 心跳测试和包含两个版本 Provider 的真实 ZooKeeper + Netty
+  端到端测试均通过，六个 Maven 模块全部构建成功。
+
+#### 当前限制与下一步
+
+- 新路径与早期只按接口名的 ZooKeeper 地址路径不兼容，Provider、Consumer 和共享
+  API 应一起升级；旧持久空目录不会自动删除，但不包含临时地址，不影响发现；
+- 当前只支持精确 group/version，不支持通配、版本范围、自动降级和百分比流量；
+- `@RpcReference` 是静态注解，切换版本需要重新发布 Consumer，尚无动态路由规则；
+- 路径下暂时只保存地址，没有权重、区域、健康度等 Provider 元数据；
+- 下一步建议进入 Filter 调用链：先定义 Consumer/Provider 两侧统一拦截边界，为
+  Metrics、Tracing、鉴权和限流提供扩展位置。

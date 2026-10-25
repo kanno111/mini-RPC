@@ -70,11 +70,16 @@ JDK 动态代理
 | S5-I-C | Provider 静默客户端 Channel 清理 | 已完成 |
 | S5-I-D-A | 真实 Netty PING/PONG 往返集成测试 | 已完成 |
 | S5-I-D-B | 心跳超时断连与按需重连集成测试 | 已完成 |
+| R1-A | ServiceKey 与 Provider 本地版本/分组路由 | 已完成 |
+| R1-B | `@RpcService` / `@RpcReference` 版本与分组传递 | 已完成 |
+| R1-C | ZooKeeper、缓存、Watch 与负载均衡接入 ServiceKey | 已完成 |
 | M5 | SPI、重试、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
 [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) 和续篇
-[DEVELOPMENT_LOG2.md](DEVELOPMENT_LOG2.md)。
+[DEVELOPMENT_LOG2.md](DEVELOPMENT_LOG2.md)。基于 `DEVELOPMENT_LOG2.md` 3.37 / S5-I-D-B
+阶段的生产成熟度、主流框架差距和后续优先级评估参见
+[PRODUCTION_READINESS_GAP.md](PRODUCTION_READINESS_GAP.md)。
 
 ---
 
@@ -93,6 +98,18 @@ mini-RPC
 ├── mini-rpc-example-provider
 └── mini-rpc-example-consumer
 ```
+
+项目当前使用的发布坐标与 Java 命名空间为：
+
+```text
+Maven groupId：io.github.kaano
+Java 基础包：io.github.kaano.minirpc
+```
+
+这两个名称分别解决“Maven 依赖属于谁”和“Java 类放在哪个命名空间”。
+它们已从早期教学包名迁移为项目维护者的 GitHub 命名空间。由于接口全限定名
+同时是当前 RPC 服务标识的一部分，旧包名版本与新包名版本不直接互通；
+Provider、Consumer 和共享 API 模块应一起升级。
 
 模块依赖关系：
 
@@ -203,6 +220,24 @@ private HelloService helloService;
 没有填写 `timeoutMillis` 时继续使用全局配置。覆盖值只改变这个代理每次调用等待
 响应的时间；不同代理仍然共享同一个 Netty 客户端、Channel 和 ZooKeeper 连接。
 
+同一个接口存在多个版本或分组时，Provider 和 Consumer 可以使用注解选择相同的
+服务身份：
+
+```java
+@RpcService(
+        serviceInterface = HelloService.class,
+        group = "gray",
+        version = "2.0"
+)
+
+@RpcReference(group = "gray", version = "2.0")
+private HelloService helloService;
+```
+
+group/version 省略时默认使用 `default/1.0`，显式值不能为空。它们已经贯通
+Spring 注入、动态代理、ZooKeeper 注册发现、负载均衡和 Provider 本地服务表；
+不同 Provider 分别部署不同版本时，Consumer 只会发现自己选择的版本地址。
+
 `heartbeat-interval` 控制 Consumer Channel 写空闲多久后发送 PING，默认 15 秒；
 `heartbeat-timeout` 控制连续多久没有读到 PONG 或普通响应后关闭 Channel，默认
 45 秒。两个值都必须至少为 1 毫秒，并且超时时间必须严格大于发送间隔，例如：
@@ -216,7 +251,7 @@ mini-rpc:
 这两个值属于整个 Consumer Netty 客户端，而不是某个 `@RpcReference`。不同远程
 引用共享 Channel，因此也共享同一套连接存活判断。
 
-Consumer 示例默认将 `com.itheima.transport.client` 日志调为 `DEBUG`，
+Consumer 示例默认将 `io.github.kaano.minirpc.transport.client` 日志调为 `DEBUG`，
 便于在控制台观察写空闲后发送 PING 和收到 PONG。这只是示例应用的
 观察配置，不是 Starter 强制的日志级别；实际应用可按需移除或改为
 `INFO`：
@@ -224,7 +259,7 @@ Consumer 示例默认将 `com.itheima.transport.client` 日志调为 `DEBUG`，
 ```yaml
 logging:
   level:
-    com.itheima.transport.client: DEBUG
+    io.github.kaano.minirpc.transport.client: DEBUG
 ```
 
 必须先发起一次 RPC 调用建立 Channel，之后写空闲计时器才会开始工作；
@@ -317,7 +352,7 @@ HelloService.java
 ## 4. core 模块包结构
 
 ```text
-com.itheima
+io.github.kaano.minirpc
 ├── annotation     服务端和客户端使用的 RPC 注解
 ├── client         客户端高层入口
 ├── cluster        服务发现和负载均衡的组合层
@@ -335,15 +370,22 @@ com.itheima
 
 | 类 | 作用 |
 |---|---|
-| `RpcService` | 标记一个类是 RPC 服务实现，并指定要暴露的公共接口 |
-| `RpcReference` | 标记 Consumer 中需要注入 RPC 动态代理的接口字段 |
+| `RpcService` | 标记 RPC 服务实现，并声明接口、group 和 version |
+| `RpcReference` | 标记 Consumer 代理字段，并选择 group、version 和可选超时 |
 
 示例：
 
 ```java
-@RpcService(serviceInterface = HelloService.class)
+@RpcService(
+        serviceInterface = HelloService.class,
+        group = "gray",
+        version = "2.0"
+)
 public class HelloServiceImpl implements HelloService {
 }
+
+@RpcReference(group = "gray", version = "2.0")
+private HelloService helloService;
 ```
 
 注解只是类上的元数据，不会自己执行代码。Spring Boot 模式下，Starter 负责
@@ -355,7 +397,8 @@ public class HelloServiceImpl implements HelloService {
 | 类 | 作用 |
 |---|---|
 | `RpcProtocol` | 保存魔数、版本、消息类型、序列化类型、状态和协议头长度 |
-| `RpcRequest` | 描述接口、方法、参数、请求编号、版本和 deadline |
+| `ServiceKey` | 用接口全限定名、group、version 唯一标识一个 RPC 服务 |
+| `RpcRequest` | 描述接口、方法、参数、请求编号、分组、版本和 deadline |
 | `RpcResponse` | 描述服务端返回的数据或异常信息 |
 | `RpcException` | 框架统一使用的运行时异常 |
 
@@ -366,13 +409,19 @@ helloService.sayHello("Tom")
              ↓
 RpcRequest
 ├── requestId       1
-├── interfaceName   com.itheima.example.api.HelloService
+├── interfaceName   io.github.kaano.minirpc.example.api.HelloService
 ├── methodName      sayHello
 ├── parameterTypes  [java.lang.String]
 ├── parameters      ["Tom"]
-├── version          当前预留，尚未参与路由
+├── group            default
+├── version          1.0
 └── deadlineEpochMillis  Consumer 等待响应的绝对截止时间
 ```
+
+Provider 收到请求后，会把 `interfaceName + group + version` 组成不可变
+`ServiceKey`，再从本地服务表精确查找实现。旧 Consumer 没有携带 group 或 version
+时，会兼容到 `default/1.0`。同一个 ServiceKey 同时用于注册中心路径、地址缓存、
+Watch 失效和轮询状态，避免发现阶段与 Provider 执行阶段选择不同服务身份。
 
 ### 4.3 serialize：序列化
 
@@ -395,15 +444,15 @@ Java 对象 ⇄ byte[]
 | 类 | 作用 |
 |---|---|
 | `ServiceProvider` | 本地服务表抽象 |
-| `DefaultServiceProvider` | 使用 ConcurrentHashMap 保存接口名到实现对象的映射 |
+| `DefaultServiceProvider` | 使用 ConcurrentHashMap 保存 ServiceKey 到实现对象的映射 |
 | `RpcRequestHandler` | 根据请求查找实现对象并通过反射执行方法 |
 
 本地服务表保存：
 
 ```text
-com.itheima.example.api.HelloService
-                    ↓
-          HelloServiceImpl 对象
+ServiceKey(HelloService, default, 1.0) → HelloServiceV1Impl
+ServiceKey(HelloService, default, 2.0) → HelloServiceV2Impl
+ServiceKey(HelloService, gray,    2.0) → HelloServiceGrayV2Impl
 ```
 
 这里的 `ServiceProvider` 不要和“远程 Provider 地址”混淆。它只存在于服务端
@@ -425,25 +474,35 @@ ZooKeeper 中保存的结构：
 ```text
 /mini-rpc
 └── services
-    └── com.itheima.example.api.HelloService
-        ├── 127.0.0.1:8080
-        └── 127.0.0.1:8081
+    └── io.github.kaano.minirpc.example.api.HelloService
+        ├── default
+        │   ├── 1.0
+        │   │   └── providers
+        │   │       └── 127.0.0.1%3A8080
+        │   └── 2.0
+        │       └── providers
+        │           └── 127.0.0.1%3A8081
+        └── gray
+            └── 2.0
+                └── providers
+                    └── 127.0.0.1%3A9080
 ```
 
-服务目录是持久节点，Provider 地址是临时节点。Provider 会话失效后，对应的
-临时地址会由 ZooKeeper 自动删除。
+接口、group、version 和地址都是独立路径片段，并经过 UTF-8 百分号编码；例如
+地址中的冒号会表示为 `%3A`。服务目录是持久节点，Provider 地址是临时节点。
+Provider 会话失效后，对应临时地址会由 ZooKeeper 自动删除。
 
-当前 `ZooKeeperServiceDiscovery` 会把查询结果在 Consumer 内存中缓存 3 秒，并在
-查询时注册一次性 ZooKeeper Watch。Provider 上下线后，Watch 会立即删除对应
-缓存；下一次调用重新查询并注册新的 Watch。3 秒有效期保留为网络或会话异常时
-的兜底。
+当前 `ZooKeeperServiceDiscovery` 按完整 ServiceKey 把查询结果在 Consumer 内存中
+缓存 3 秒，并为每个版本目录注册一次性 ZooKeeper Watch。某个版本的 Provider
+上下线后，Watch 只删除该 ServiceKey 的缓存；下一次调用重新查询并注册新的
+Watch。3 秒有效期保留为网络或会话异常时的兜底。
 
 ### 4.6 loadbalance：负载均衡
 
 | 类 | 作用 |
 |---|---|
 | `LoadBalance` | 从地址列表选择一个 Provider 的接口 |
-| `RoundRobinLoadBalance` | 按服务名称分别维护计数器，实现轮询选择 |
+| `RoundRobinLoadBalance` | 按 ServiceKey 分别维护计数器，实现轮询选择 |
 | `RandomLoadBalance` | 从候选 Provider 中等概率随机选择一个地址 |
 
 如果地址列表是：
@@ -465,13 +524,13 @@ ZooKeeper 中保存的结构：
 
 | 类 | 作用 |
 |---|---|
-| `ServiceAddressResolver` | 根据服务名称得到一个最终调用地址的接口 |
+| `ServiceAddressResolver` | 根据完整 ServiceKey 得到一个最终调用地址的接口 |
 | `DefaultServiceAddressResolver` | 先发现全部地址，再交给负载均衡器选择一个 |
 
 这个包把两个动作连接起来：
 
 ```text
-服务名称
+ServiceKey(interfaceName, group, version)
    ↓ ServiceDiscovery
 全部 Provider 地址
    ↓ LoadBalance
@@ -507,7 +566,11 @@ Spring Boot 客户端业务只需要：
 @SpringBootApplication
 public class ConsumerApplication implements CommandLineRunner {
 
-    @RpcReference(timeoutMillis = 750)
+    @RpcReference(
+            group = "gray",
+            version = "2.0",
+            timeoutMillis = 750
+    )
     private HelloService helloService;
 
     @Override
@@ -519,8 +582,9 @@ public class ConsumerApplication implements CommandLineRunner {
 
 `ConsumerApplication` 由 Spring 创建时，`RpcReferenceBeanPostProcessor` 会在
 初始化之前注入代理。只有直接使用 core 的非 Spring 项目，才需要手动创建
-`RpcClientFactory` 并调用 `injectReferences()`。`timeoutMillis` 必须是正数；省略
-时使用全局 `mini-rpc.request-timeout`，配置为 0 或其他负数会在注入阶段报错。
+`RpcClientFactory` 并调用 `injectReferences()`。group/version 必须和 Provider 一致；
+`timeoutMillis` 必须是正数，省略时使用全局 `mini-rpc.request-timeout`，配置为 0
+或其他负数会在注入阶段报错。
 
 ### 4.10 server：服务端高层入口
 
@@ -534,7 +598,11 @@ public class ConsumerApplication implements CommandLineRunner {
 Spring Boot 服务端业务只需要声明实现类：
 
 ```java
-@RpcService(serviceInterface = HelloService.class)
+@RpcService(
+        serviceInterface = HelloService.class,
+        group = "gray",
+        version = "2.0"
+)
 public class HelloServiceImpl implements HelloService {
 
     private final SomeBusinessDependency dependency;
@@ -650,14 +718,14 @@ SpringRpcProviderLifecycle.start()
                ↓
 RpcProvider.registerService(...)
 DefaultServiceProvider 写入当前 JVM 的本地映射
-HelloService 全限定名 → HelloServiceImpl 对象
+ServiceKey(HelloService, group, version) → HelloServiceImpl 对象
                ↓
 后台线程运行 RpcProvider.start()
 NettyRpcServer 绑定并开始监听 8080
                ↓ 绑定成功回调
 RpcProvider.publishServices()
 ZooKeeperServiceRegistry 创建临时地址节点
-HelloService 全限定名 → 127.0.0.1:8080
+ServiceKey(HelloService, group, version) → 127.0.0.1:8080
                ↓
 服务可以被远程调用
 ```
@@ -665,9 +733,9 @@ HelloService 全限定名 → 127.0.0.1:8080
 一个服务真正可调用，需要同时满足：
 
 1. 服务实现对象已经创建；
-2. 本地服务表已经保存接口到对象的映射；
+2. 本地服务表已经保存 ServiceKey 到对象的映射；
 3. Netty 已经成功监听对应端口；
-4. ZooKeeper 已经保存接口到网络地址的映射。
+4. ZooKeeper 已经保存 ServiceKey 到网络地址的映射。
 
 第 3 步必须先于第 4 步。如果端口被其他程序占用，Netty 绑定失败，启动成功
 回调不会执行，ZooKeeper 中也就不会出现这个无法连接的 Provider 地址。
@@ -723,11 +791,11 @@ String result = helloService.sayHello("world");
 2. RpcClientProxy 拦截 sayHello 方法
                       ↓
 3. 构造 RpcRequest
-   接口名 + 方法名 + 参数类型 + 参数值 + requestId
+   接口名 + group + version + 方法名 + 参数 + requestId
                       ↓
 4. DefaultServiceAddressResolver 开始选址
                       ↓
-5. ZooKeeperServiceDiscovery 查询全部 Provider 地址
+5. ZooKeeperServiceDiscovery 只查询匹配 ServiceKey 的 Provider 地址
                       ↓
 6. 配置的 LoadBalance 策略选择一个地址
                       ↓
@@ -932,9 +1000,9 @@ Spring 构造器注入测试。Docker 可用时，还会由 Testcontainers 临�
 后容器自动删除，不依赖 9.2 中手工创建的 `mini-rpc-zookeeper` 容器。
 
 端到端测试会验证：Provider 注册临时节点、Consumer 发现地址并完成动态代理
-RPC、Provider 关闭后临时节点消失，以及 ZooKeeper Watch 让 Consumer 的 30 秒
-地址缓存提前失效。若 Docker 未启动，该容器用例会明确标记为跳过，其余单元测试
-仍会继续执行。
+RPC、Provider 关闭后临时节点消失、ZooKeeper Watch 让 Consumer 的 30 秒地址缓存
+提前失效，以及同一接口的 V1/V2 Provider 能被两个版本代理精确隔离。若 Docker
+未启动，该容器用例会明确标记为跳过，其余单元测试仍会继续执行。
 
 ### 9.4 在 IDEA 启动 Provider
 
@@ -942,7 +1010,7 @@ RPC、Provider 关闭后临时节点消失，以及 ZooKeeper Watch 让 Consumer
 
 ```text
 mini-rpc-example-provider
-└── com.itheima.example.provider.ProviderMain
+└── io.github.kaano.minirpc.example.provider.ProviderMain
 ```
 
 Provider 是 Spring Boot 应用，默认从 `application.yml` 读取端口 8080。启动后
@@ -964,7 +1032,7 @@ Starter 会自动扫描 `@RpcService`、注册 ZooKeeper 地址并启动 Netty�
 
 ```text
 mini-rpc-example-consumer
-└── com.itheima.example.consumer.ConsumerMain
+└── io.github.kaano.minirpc.example.consumer.ConsumerMain
 ```
 
 `HelloConsumerRunner` 会连续调用四次。如果 8080 和 8081 都已注册，可以在
@@ -1045,7 +1113,8 @@ mini-rpc-example-consumer
 
 1. 服务发现已有本地缓存和一次性 ZooKeeper Watch，但当前是“变化后失效、下次
    调用再查询”，尚未在后台主动构建最新地址快照；
-2. `RpcRequest.version` 已预留，但尚未用于服务版本路由；
+2. group/version 已贯通完整分布式调用链，但当前只支持精确匹配，没有版本范围、
+   通配分组、自动降级或运行时动态流量比例；切换注解值仍需要重新发布 Consumer；
 3. Consumer 和 Provider 的空闲时间都已支持 Starter 全局配置，但还不能按服务或
    单个 `@RpcReference` 覆盖；两端属于不同进程，Provider 阈值与 Consumer 心跳
    间隔目前需要部署者自行协调；
@@ -1067,12 +1136,15 @@ mini-rpc-example-consumer
 
 ## 12. 下一步演进方向
 
-Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
+Spring 基础链路和第一批运行可靠性能力已经完整跑通。接下来优先补齐
+已有调用模型中的语义、观测和扩展缺口：
 
-1. 先设计有限重试的边界：只重试明确尚未执行的连接/写入失败，
-   避免已经到达 Provider 的非幂等请求被重复执行；
-2. 再逐步加入 SPI 和更多策略配置；
-3. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
+1. 建立 Consumer/Provider Filter 调用链，为 Metrics、Tracing、鉴权和限流
+   提供统一扩展位置；
+2. 增加 Micrometer 核心指标，再实现 Serializer/LoadBalance 的最小 SPI；
+3. 默认不做透明业务重试，重试由业务根据幂等性显式决定；
+4. 补充 CI、性能基线和弱网/长稳测试；
+5. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
    执行前检查与协作式检查，因此暂缓到确有需求时再实现，避免过度设计。
 
 更细的 Spring 分步计划参见
@@ -1081,7 +1153,11 @@ Spring 基础链路和第一批配置能力已经完整跑通。接下来优先�
 目标使用体验可以逐步演进为：
 
 ```java
-@RpcService
+@RpcService(
+        serviceInterface = HelloService.class,
+        group = "default",
+        version = "1.0"
+)
 public class HelloServiceImpl implements HelloService {
 }
 ```
@@ -1089,7 +1165,11 @@ public class HelloServiceImpl implements HelloService {
 客户端：
 
 ```java
-@RpcReference(timeoutMillis = 750) // 可选；省略时继承全局超时
+@RpcReference(
+        group = "default",
+        version = "1.0",
+        timeoutMillis = 750
+)
 private HelloService helloService;
 ```
 

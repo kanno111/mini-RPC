@@ -165,7 +165,7 @@ mini-RPC
 
 **关键点**：
 - `pom.xml` 引入 `curator-framework`、`curator-recipes`。
-- **服务注册**（服务端）：启动时把 `服务名 -> 地址列表` 写入 ZK 临时节点（如 `/mini-rpc/com.itheima.api.HelloService/127.0.0.1:8080`），断开自动清除。
+- **服务注册**（服务端）：启动时把 `服务名 -> 地址列表` 写入 ZK 临时节点（如 `/mini-rpc/io.github.kaano.minirpc.api.HelloService/127.0.0.1:8080`），断开自动清除。
 - **服务发现**（客户端）：拉取服务名下的地址列表，`TreeCache` 监听节点变化动态更新本地缓存。
 - **负载均衡**：`RandomLoadBalance` / `RoundRobinLoadBalance`，从地址列表选一个建连。
 - 注解 `@RpcService` 扫描并自动注册服务；`@RpcReference` 注入代理。

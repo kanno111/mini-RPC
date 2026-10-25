@@ -1,1 +1,1 @@
-com.itheima.spring.autoconfigure.MiniRpcAutoConfiguration
+io.github.kaano.minirpc.spring.autoconfigure.MiniRpcAutoConfiguration
