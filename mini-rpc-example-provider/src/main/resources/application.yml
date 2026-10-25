@@ -12,4 +12,8 @@ mini-rpc:
   server-port: 8080
   # Spring 关闭时最多等待 10 秒，让已经开始的 RPC 请求完成响应。
   shutdown-timeout: 10s
+  # 独立业务线程执行 @RpcService 方法，Netty worker 只负责网络事件。
+  provider-business-threads: 8
+  # 线程都忙时最多允许 1024 个请求排队；超过后快速返回 Provider 繁忙。
+  provider-business-queue-capacity: 1024
   load-balance: round_robin

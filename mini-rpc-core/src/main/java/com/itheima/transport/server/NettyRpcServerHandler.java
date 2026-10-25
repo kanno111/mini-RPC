@@ -10,6 +10,9 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+
 /**
  * Netty 服务端的 RPC 业务处理器。
  *
@@ -22,7 +25,9 @@ import org.slf4j.LoggerFactory;
  *    ↓
  * RpcDecoder：切出完整协议帧，并把正文还原成 RpcRequest
  *    ↓
- * NettyRpcServerHandler：执行请求，得到 RpcResponse
+ * NettyRpcServerHandler：把请求提交给 Provider 业务线程池
+ *    ↓
+ * Provider 业务线程：执行请求，得到 RpcResponse
  *    ↓
  * RpcEncoder：RpcResponse 变成网络字节
  * </pre>
@@ -42,19 +47,17 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
     /** 统计已进入业务执行、但响应写入尚未完成的请求。 */
     private final InFlightRequestTracker requestTracker;
 
-    /**
-     * 创建 Netty 服务端业务处理器。
-     *
-     * @param requestHandler 已经配置好服务注册表的请求执行器，不能为 {@code null}
-     */
-    public NettyRpcServerHandler(RpcRequestHandler requestHandler) {
-        this(requestHandler, new InFlightRequestTracker());
-    }
+    /** 把耗时服务方法从 Netty worker EventLoop 转移到独立业务线程。 */
+    private final Executor businessExecutor;
 
-    /** 让 NettyRpcServer 和 Handler 共享同一个在途请求计数器。 */
+    /**
+     * 让 NettyRpcServer、Handler 和业务线程池共享同一条请求生命周期。
+     * 测试可以传入同步执行器或可控执行器，生产环境传入有界业务线程池。
+     */
     NettyRpcServerHandler(
             RpcRequestHandler requestHandler,
-            InFlightRequestTracker requestTracker
+            InFlightRequestTracker requestTracker,
+            Executor businessExecutor
     ) {
         if (requestHandler == null) {
             throw new RpcException("RpcRequestHandler 不能为空");
@@ -62,8 +65,12 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
         if (requestTracker == null) {
             throw new RpcException("InFlightRequestTracker 不能为空");
         }
+        if (businessExecutor == null) {
+            throw new RpcException("Provider 业务执行器不能为空");
+        }
         this.requestHandler = requestHandler;
         this.requestTracker = requestTracker;
+        this.businessExecutor = businessExecutor;
     }
 
     /**
@@ -90,21 +97,90 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
             return;
         }
 
-        // 第一步：复用 M1 已有逻辑，查找服务并反射执行目标方法。
+        /*
+         * channelRead0 运行在 Netty worker EventLoop。这里只提交任务便立即返回，
+         * 让 EventLoop 能继续处理同一线程管理的其他 Channel，不能在这里直接
+         * 调用 requestHandler.handle(request)。
+         */
+        try {
+            businessExecutor.execute(
+                    () -> executeAndRespond(context, request)
+            );
+        } catch (RejectedExecutionException exception) {
+            /*
+             * 有界线程池达到容量或已经关闭时，AbortPolicy 会走到这里。
+             * 明确返回失败比 CallerRunsPolicy、静默丢弃或无限排队更安全。
+             */
+            logRejectedRequest(request.getRequestId());
+            writeTrackedResponse(
+                    context,
+                    RpcResponse.failure(
+                            request.getRequestId(),
+                            new RpcException(
+                                    "RPC Provider 业务线程池繁忙，拒绝新的请求",
+                                    exception
+                            )
+                    )
+            );
+        }
+    }
+
+    /** 记录过载现场；生产执行器可以提供比通用 Executor 更完整的线程池数据。 */
+    private void logRejectedRequest(long requestId) {
+        if (businessExecutor instanceof ProviderBusinessExecutor executor) {
+            ProviderBusinessExecutor.Statistics statistics =
+                    executor.snapshot();
+            LOGGER.warn(
+                    "Provider 业务任务被拒绝，requestId：{}，线程数：{}，活跃：{}，"
+                            + "排队：{}，队列剩余：{}，累计完成：{}，累计拒绝：{}，"
+                            + "已关闭：{}",
+                    requestId,
+                    statistics.configuredThreadCount(),
+                    statistics.activeThreadCount(),
+                    statistics.queuedTaskCount(),
+                    statistics.remainingQueueCapacity(),
+                    statistics.completedTaskCount(),
+                    statistics.rejectedTaskCount(),
+                    statistics.shutdown()
+            );
+            return;
+        }
+
+        LOGGER.warn("Provider 业务任务被拒绝，requestId：{}", requestId);
+    }
+
+    /** 在 Provider 业务线程中查找服务、反射调用并安排响应写回。 */
+    private void executeAndRespond(
+            ChannelHandlerContext context,
+            RpcRequest request
+    ) {
         RpcResponse response;
         try {
             response = requestHandler.handle(request);
         } catch (RuntimeException exception) {
             /*
-             * 正常业务异常会由 RpcRequestHandler 转换成失败响应；这里防守其自身
-             * 意外抛出的运行时异常，确保计数不会永远无法归零。
+             * 该方法现在运行在普通业务线程中，异常不能再依赖 Netty Pipeline
+             * 自动捕获。因此把请求执行器自身的意外异常也转换成失败响应，确保
+             * Consumer 得到结果，并让在途计数最终能够归零。
              */
-            requestTracker.finishRequest();
-            throw exception;
+            response = RpcResponse.failure(request.getRequestId(), exception);
         }
 
+        writeTrackedResponse(context, response);
+    }
+
+    /**
+     * 写回一个已经计入在途数量的响应，并在写操作完成后归还计数。
+     *
+     * <p>{@link ChannelHandlerContext#writeAndFlush(Object)} 可以从业务线程调用；
+     * Netty 会把真正的编码和 Socket 写入调度回该 Channel 所属的 EventLoop。</p>
+     */
+    private void writeTrackedResponse(
+            ChannelHandlerContext context,
+            RpcResponse response
+    ) {
         /*
-         * 第二步：把响应写回当前客户端。
+         * 把响应写回当前客户端。
          * writeAndFlush 并不是直接把 Java 对象塞进网络：响应会沿着 Pipeline 的
          * 出站方向经过 RpcEncoder，编码成 [20 字节协议头 + 正文] 后才真正发送。
          *
@@ -118,7 +194,8 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
         } catch (RuntimeException exception) {
             // writeAndFlush 同步失败时不会触发 Future listener，需要在这里归还计数。
             requestTracker.finishRequest();
-            throw exception;
+            LOGGER.error("提交 RPC 响应写入失败，将关闭当前连接", exception);
+            context.close();
         }
     }
 

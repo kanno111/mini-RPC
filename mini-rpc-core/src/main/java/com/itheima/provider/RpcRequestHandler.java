@@ -93,8 +93,19 @@ public class RpcRequestHandler {
                     parameterTypes
             );
 
-            // 第三步：在服务实现对象上执行方法，并传入客户端提供的参数值。
-            Object result = method.invoke(service, parameters);
+            /*
+             * 第三步：只在服务方法执行期间绑定调用上下文。业务代码可以通过
+             * RpcCallContext.checkDeadline() 在安全点协作式结束超时工作。
+             * try-with-resources 保证成功、业务异常和反射异常三种路径都会清理
+             * ThreadLocal，避免 Netty 工作线程复用时把旧请求信息泄漏给下一次调用。
+             */
+            Object result;
+            try (RpcCallContext.Scope ignored = RpcCallContext.bind(
+                    requestId,
+                    deadlineEpochMillis
+            )) {
+                result = method.invoke(service, parameters);
+            }
 
             // void 方法的 result 是 null，也属于执行成功。
             return RpcResponse.success(requestId, result);

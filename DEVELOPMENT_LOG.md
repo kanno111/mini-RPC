@@ -1398,6 +1398,164 @@ deadline 不改变 Consumer 原来的本地等待保护：Consumer 仍然使用�
 - 当前限制是绝对 deadline 依赖两端时钟同步，并且无法取消已经开始执行的服务方法；
   下一步建议设计 Provider 执行中的协作式取消。
 
+### 3.28 S5-H-B：Provider 执行中 deadline 协作式检查
+
+- 日期：2026-10-24
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+S5-H-A 只能在服务方法开始前拒绝过期请求。一旦 `Method.invoke(...)` 已经进入耗时
+循环或分批任务，Consumer 即使不再等待，Provider 仍会继续执行。本步先提供一个
+安全、可审核的协作式机制，让业务代码能够在自己选择的数据一致性边界检查 deadline。
+
+#### 主要修改
+
+- 新增 `RpcCallContext`，使用 `ThreadLocal` 保存当前 Provider 调用的 requestId 和
+  `deadlineEpochMillis`；
+- `RpcRequestHandler` 只在反射调用服务方法期间绑定上下文，并通过
+  `try-with-resources` 在成功、业务异常和反射异常路径统一清理；
+- `RpcCallContext.checkDeadline()` 在当前时间到达 deadline 时抛出 `RpcException`，
+  该异常沿现有反射异常处理链转换为失败 `RpcResponse`；
+- deadline 为 0 的兼容请求不会被执行中检查拒绝；嵌套绑定关闭后会恢复外层上下文；
+- 新增上下文边界、无 deadline、嵌套恢复以及请求执行期间可见性的单元测试；
+- README 同步补充使用方法、完整调用链、当前限制和下一步。
+
+#### 行为变化与调用链
+
+```text
+RpcRequestHandler 确认请求尚未过期
+        ↓
+绑定 RpcCallContext(requestId, deadline)
+        ↓
+Method.invoke(...) 执行业务方法
+        ↓
+耗时业务在安全点调用 checkDeadline()
+        ├── 未到期或没有 deadline：继续执行
+        └── 已到期：抛出 RpcException，形成失败响应
+        ↓
+finally 语义关闭 Scope，清理 ThreadLocal
+```
+
+普通短时服务不需要调用这个 API。只有确实可能长时间运行、并且能够明确选择安全
+停止点的业务，才需要在循环或每批任务之间主动检查。
+
+#### 设计原因
+
+- Java 无法安全地从外部强制终止任意用户代码；`Thread.stop()` 可能在持锁或数据
+  更新一半时破坏业务状态，因此本步采用由业务选择安全点的协作式取消；
+- 上下文只包围 `Method.invoke(...)`，避免服务查找和反射准备阶段误暴露为业务执行；
+- 关闭作用域时恢复旧值而不是简单删除，使同一线程出现嵌套调用时仍能回到外层上下文；
+- 在没有上下文时读取 requestId/deadline 会明确抛错，避免把 0 误认为真实请求信息。
+
+#### 验证方式、当前限制与下一步
+
+- `RpcCallContextTest` 验证 deadline 边界、0 deadline、作用域清理和嵌套恢复；
+- `RpcRequestHandlerDeadlineTest` 验证业务方法能读取本次 requestId/deadline，返回后
+  当前线程不残留上下文；
+- 已执行上述定向测试，6 个测试全部通过；
+- 执行根工程 `mvn test`，core 31 个测试中 30 个通过、容器测试因 Docker 未运行
+  跳过，Starter 12 个测试全部通过，六个 Maven 模块构建成功；
+- 当前仍是协作式机制：不调用 `checkDeadline()` 的阻塞业务不会自动结束；
+- `ThreadLocal` 不会自动传播到业务自行创建的异步线程；
+- 下一步建议把业务方法执行从 Netty I/O EventLoop 移到独立业务线程池，再单独设计
+  deadline 到达时的任务中断和“响应只完成一次”保护。
+
+### 3.29 S5-H-C-A：Provider Netty I/O 与业务线程隔离
+
+- 日期：2026-10-24
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+此前 `NettyRpcServerHandler.channelRead0()` 会直接调用
+`RpcRequestHandler.handle()`，所以 `Method.invoke(...)` 实际运行在 Netty worker
+EventLoop 上。一个慢服务方法会阻塞该 EventLoop 管理的其他 Channel，网络读取、
+响应写回和连接事件都可能被延迟。本步先把业务执行移到 Provider 独立线程池。
+
+#### 主要修改
+
+- 新增 `ProviderBusinessExecutor`，使用固定数量业务线程和 `ArrayBlockingQueue`
+  有界队列；默认线程数为可用处理器数量与 2 的较大值，队列容量为 1,024；
+- 业务线程统一命名为 `mini-rpc-provider-business-*`，便于日志和线程转储定位；
+- `NettyRpcServerHandler` 取得在途许可后只向业务执行器提交任务，随后立即结束本次
+  EventLoop 调用；服务查找、deadline 检查和反射调用都在业务线程执行；
+- 业务线程得到 `RpcResponse` 后调用 `writeAndFlush()`，Netty 再把真正的编码和
+  Socket 写入调度到 Channel 所属 EventLoop；
+- 使用有界队列和 `AbortPolicy`。线程与队列都满、或停机期间执行器已经关闭时，
+  Handler 返回明确失败响应并正确归还在途计数；
+- `NettyRpcServer.stop()` 在请求排空成功后正常关闭业务线程池，排空超时时使用
+  `shutdownNow()` 向剩余任务发出中断，然后继续关闭 Netty；
+- 新增任务分发、独立线程、队列饱和拒绝以及拒绝后计数归还测试；README 同步更新
+  线程模型、完整调用链、限制和下一步。
+
+#### 行为变化与线程调用链
+
+修改前：
+
+```text
+Netty worker EventLoop
+        ↓
+解码 RpcRequest
+        ↓
+RpcRequestHandler.handle()
+        ↓
+Method.invoke(...) 可能长时间阻塞 EventLoop
+```
+
+修改后：
+
+```text
+Netty worker EventLoop
+        ↓
+解码 RpcRequest 并取得在途许可
+        ↓
+提交 ProviderBusinessExecutor
+        ↓
+立即返回处理其他 Channel
+
+Provider 业务线程
+        ↓
+RpcRequestHandler.handle()
+        ↓
+绑定 RpcCallContext 并执行 Method.invoke(...)
+        ↓
+生成 RpcResponse，调用 writeAndFlush()
+        ↓
+Netty EventLoop 编码并写入 Socket
+```
+
+#### 设计原因
+
+- Netty EventLoop 的价值是用少量线程管理大量连接，Handler 必须快速返回；耗时
+  用户代码放在 EventLoop 中会扩大单个慢请求的影响范围；
+- 不使用 `Executors.newFixedThreadPool()`，因为其默认无界队列会在持续过载时不断
+  占用内存；有界队列让 Provider 的最大积压量明确可控；
+- 不使用 `CallerRunsPolicy`，因为任务提交者正是 Netty EventLoop，调用者执行会在
+  过载时让线程隔离失效；也不静默丢弃，否则 Consumer 只能等待超时；
+- 业务线程池由 `NettyRpcServer` 持有，确保它与监听端口、workerGroup 使用同一套
+  Provider 生命周期，而不是为每条 Channel 创建线程池；
+- `RpcCallContext` 仍由 `RpcRequestHandler` 在反射调用周围绑定，因此迁移后会自然
+  绑定到真正执行业务的线程，并继续通过作用域关闭避免线程池复用导致上下文串线。
+
+#### 验证方式、当前限制与下一步
+
+- `NettyRpcServerHandlerDrainTest` 使用可控执行器验证：`channelRead0()` 只提交任务，
+  任务真正运行前不会调用 `RpcRequestHandler`，响应写入后在途计数归零；
+- 同一测试验证执行器拒绝请求时不会执行业务，并返回失败响应、归还在途计数；
+- `ProviderBusinessExecutorTest` 验证任务运行在独立命名线程，以及“1 个工作线程 +
+  容量 1 的队列”全部占满后第三个任务会收到 `RejectedExecutionException`；
+- 已执行线程隔离、deadline 和调用上下文相关定向测试，12 个测试全部通过；
+- 执行根工程 `mvn test`，core 35 个测试中 34 个通过、容器测试因 Docker 未运行
+  跳过，Starter 12 个测试全部通过，六个 Maven 模块构建成功；
+- 当前线程数和队列容量还是框架内部默认值，尚未接入 `MiniRpcProperties`；
+- 当前拒绝响应仍使用通用 `RpcException`，协议还没有“Provider 过载”专用状态码；
+- deadline 到达后还不会自动取消已经提交的 `Future`；
+- 下一步建议实现 S5-H-C-B：通过 Starter 配置业务线程数和队列容量，并在拒绝日志
+  中报告活跃线程数和队列积压量。
+
 ---
 
 ## 4. 接下来如何接入 Spring
@@ -1449,13 +1607,14 @@ deadline 不改变 Consumer 原来的本地等待保护：Consumer 仍然使用�
 
 - 状态：进行中，S5-A 全局请求超时、S5-B 缓存与 Watch、S5-C Provider 安全
   发布顺序、S5-D 容器端到端测试、S5-E 单引用超时、S5-F 策略配置、S5-G
-  优雅停机以及 S5-H-A deadline 执行前检查已完成，详细记录见 3.18～3.27；
+  优雅停机、S5-H-A deadline 执行前检查、S5-H-B 执行中协作式检查和 S5-H-C-A
+  I/O/业务线程隔离已完成，详细记录见 3.18～3.29；
 - 服务发现已有短期本地缓存和 ZooKeeper Watch；
 - Provider 已改为 Netty 端口绑定成功后再发布 ZooKeeper 地址；
 - 已使用 Testcontainers 自动验证真实 ZooKeeper + Netty 完整链路；
 - 全局和单引用请求超时已接入；序列化器和负载均衡策略已支持 Starter 配置；
 - 条件装配和清晰的启动失败提示；
-- 执行中取消、重试、心跳与更完整的自动化测试；
+- 业务线程池参数配置、自动中断、重试、心跳与更完整的自动化测试；
 - 视学习进度再引入 SPI，不在 Spring 基础链路之前堆叠过多功能。
 
 ---
@@ -1490,3 +1649,11 @@ deadline 不改变 Consumer 原来的本地等待保护：Consumer 仍然使用�
 - 写明执行过的命令、测试或人工联调；
 - 写明尚未解决的问题和推荐的下一步。
 ```
+
+---
+
+## 6. 开发记录续写位置
+
+从 S5-H-C-B（3.30）开始，新的阶段记录续写到根目录
+[`DEVELOPMENT_LOG2.md`](DEVELOPMENT_LOG2.md)。本文件保留 3.1～3.29 的历史记录，
+不再继续增长；README 仍会随架构、配置和使用方式变化同步更新。

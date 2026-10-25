@@ -61,10 +61,14 @@ JDK 动态代理
 | S5-G-A | Provider 主动摘流与 Netty 排空顺序 | 已完成 |
 | S5-G-B | 在途请求计数与可配置排空超时 | 已完成 |
 | S5-H-A | Consumer deadline 传递与 Provider 执行前检查 | 已完成 |
+| S5-H-B | Provider 执行中 deadline 协作式检查 | 已完成 |
+| S5-H-C-A | Provider Netty I/O 与业务线程隔离 | 已完成 |
+| S5-H-C-B | Provider 业务线程池配置与过载诊断 | 已完成 |
 | M5 | SPI、重试、心跳、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
-[DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)。
+[DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) 和续篇
+[DEVELOPMENT_LOG2.md](DEVELOPMENT_LOG2.md)。
 
 ---
 
@@ -174,6 +178,8 @@ mini-rpc:
   provider-enabled: false
   server-host: 127.0.0.1
   server-port: 8080
+  provider-business-threads: 8
+  provider-business-queue-capacity: 1024
 ```
 
 这些配置都已经接入实际装配。`request-timeout` 控制请求发出后等待 Provider
@@ -192,6 +198,33 @@ Netty 客户端真正发送请求前，还会把本次最终采用的超时换�
 写入 `RpcRequest.deadlineEpochMillis`。Provider 会在查找服务和反射调用之前检查
 该值；请求如果已经过期，就直接返回失败，不执行对应业务方法。已有更早 deadline
 时只会保留或收紧，不会因为下游超时更长而延长上游期限。
+
+请求开始执行后，框架会在服务方法所在的当前线程绑定 `RpcCallContext`。普通的短时
+服务方法不需要改动；可能长时间循环或分批处理的业务，可以在不会破坏数据一致性的
+安全点主动检查 deadline：
+
+```java
+while (hasMoreData()) {
+    RpcCallContext.checkDeadline();
+    processNextBatch();
+}
+```
+
+deadline 已到达时，检查会抛出 `RpcException`，随后由 Provider 转换成失败响应。
+这是协作式取消：框架不会使用危险的线程强杀，业务需要自行选择可安全停止的位置。
+上下文在服务方法返回或抛出异常后都会清理，也不会自动传播到业务自行创建的异步
+线程。
+
+Provider 收到并解码请求后，不再由 Netty worker EventLoop 直接执行服务方法，而是
+提交到独立的 `ProviderBusinessExecutor`。`provider-business-threads` 配置固定业务
+线程数，默认取“可用处理器数量”和 2 的较大值；
+`provider-business-queue-capacity` 配置有界等待队列容量，默认 1,024。两个值都
+必须大于 0，非法值会在 Provider 创建阶段失败。
+
+队列和工作线程都满时会快速返回失败响应；不会使用 `CallerRunsPolicy` 让 Netty
+I/O 线程退化成业务线程，也不会用无界队列持续占用内存。拒绝日志会记录线程数、
+活跃线程、排队数量、剩余容量、累计完成、累计拒绝和线程池关闭状态，便于区分真实
+过载与停机期间的提交竞争。
 
 `shutdown-timeout` 只用于 Provider 关闭，默认 10 秒。Provider 摘流后不再让新请求
 进入业务方法，并在这段时间内等待已经开始的请求完成响应写入；超时后记录剩余
@@ -670,26 +703,36 @@ String result = helloService.sayHello("world");
                       ↓
 12. 服务端 RpcDecoder 解码成 RpcRequest
                       ↓
-13. NettyRpcServerHandler 把请求交给 RpcRequestHandler
+13. NettyRpcServerHandler 取得在途请求许可
                       ↓
-14. RpcRequestHandler 检查 deadline
+14. 把请求提交到 ProviderBusinessExecutor
+    Netty worker EventLoop 立即返回继续处理网络事件
+                      ↓
+15. Provider 业务线程调用 RpcRequestHandler
+                      ↓
+16. RpcRequestHandler 检查 deadline
     已过期：直接返回失败，不执行服务方法
                       ↓ 未过期
-15. DefaultServiceProvider 根据接口名找到 HelloServiceImpl 对象
+17. DefaultServiceProvider 根据接口名找到 HelloServiceImpl 对象
                       ↓
-16. RpcRequestHandler 根据方法名和参数类型找到 Method
+18. RpcRequestHandler 根据方法名和参数类型找到 Method
                       ↓
-17. Method.invoke 执行 HelloServiceImpl.sayHello("world")
+19. 在 Provider 业务线程绑定 RpcCallContext
                       ↓
-18. 返回值包装成带有相同 requestId 的 RpcResponse
+20. Method.invoke 执行 HelloServiceImpl.sayHello("world")
+    耗时业务可在安全点调用 checkDeadline()
                       ↓
-19. RpcEncoder 编码响应并通过网络返回
+21. 清理 RpcCallContext
                       ↓
-20. 客户端 RpcDecoder 得到 RpcResponse
+22. 返回值包装成带有相同 requestId 的 RpcResponse
                       ↓
-21. NettyRpcClientHandler 根据 requestId 完成对应 future
+23. RpcEncoder 编码响应并通过网络返回
                       ↓
-22. RpcClientProxy 取出 data，作为 sayHello 的返回值
+24. 客户端 RpcDecoder 得到 RpcResponse
+                      ↓
+25. NettyRpcClientHandler 根据 requestId 完成对应 future
+                      ↓
+26. RpcClientProxy 取出 data，作为 sayHello 的返回值
 ```
 
 ### requestId 为什么重要
@@ -908,10 +951,12 @@ mini-rpc-example-consumer
    SPI、权重、最少活跃或一致性哈希等扩展；
 6. 容器端到端测试需要本机或 CI 提供可用的 Docker 引擎；没有 Docker 时该用例
    会跳过，但不影响其余单元测试；
-7. Provider 已支持在途请求计数和排空超时，但任意 Java 业务代码如果永久阻塞且
-   忽略线程中断，框架无法安全地强制终止这段用户代码；
+7. Provider 已使用可配置的有界业务线程池隔离 Netty I/O 与服务方法，但目前只有
+   全局线程池，还没有按服务隔离和 Micrometer 持续指标；任意 Java 业务代码如果
+   永久阻塞且忽略线程中断，框架仍无法安全地强制终止；
 8. deadline 使用 Consumer 的绝对 Epoch 毫秒，要求 Consumer 与 Provider 系统时钟
-   基本同步；当前只拒绝执行前已经过期的请求，尚不能取消正在执行的业务方法；
+   基本同步；执行中的请求支持通过 `RpcCallContext.checkDeadline()` 协作式结束，
+   但框架尚不会自动中断未主动检查的业务方法，上下文也不会自动传播到异步线程；
 9. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
 10. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
@@ -921,7 +966,7 @@ mini-rpc-example-consumer
 
 Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 设计 Provider 执行中的协作式取消，让可中断业务在 deadline 到达后尽快停止；
+1. 设计 deadline 到达时的任务中断和“响应只完成一次”保护；
 2. 再逐步加入心跳、有限重试、SPI 和更多策略配置。
 
 更细的 Spring 分步计划参见

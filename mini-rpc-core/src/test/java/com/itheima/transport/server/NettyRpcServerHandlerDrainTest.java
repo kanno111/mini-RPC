@@ -6,7 +6,12 @@ import com.itheima.provider.RpcRequestHandler;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -25,7 +30,11 @@ class NettyRpcServerHandlerDrainTest {
         when(requestHandler.handle(request)).thenReturn(expectedResponse);
         InFlightRequestTracker tracker = new InFlightRequestTracker();
         EmbeddedChannel channel = new EmbeddedChannel(
-                new NettyRpcServerHandler(requestHandler, tracker)
+                new NettyRpcServerHandler(
+                        requestHandler,
+                        tracker,
+                        Runnable::run
+                )
         );
 
         try {
@@ -48,7 +57,11 @@ class NettyRpcServerHandlerDrainTest {
         InFlightRequestTracker tracker = new InFlightRequestTracker();
         tracker.beginDraining();
         EmbeddedChannel channel = new EmbeddedChannel(
-                new NettyRpcServerHandler(requestHandler, tracker)
+                new NettyRpcServerHandler(
+                        requestHandler,
+                        tracker,
+                        Runnable::run
+                )
         );
 
         try {
@@ -59,6 +72,78 @@ class NettyRpcServerHandlerDrainTest {
             assertEquals(RpcResponse.FAILURE_CODE, response.getCode());
             assertEquals(0, tracker.getInFlightRequestCount());
             verifyNoInteractions(requestHandler);
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldReturnFailureAndReleaseCountWhenExecutorRejectsRequest() {
+        RpcRequest request = RpcRequest.builder()
+                .requestId(303L)
+                .build();
+        RpcRequestHandler requestHandler = mock(RpcRequestHandler.class);
+        InFlightRequestTracker tracker = new InFlightRequestTracker();
+        EmbeddedChannel channel = new EmbeddedChannel(
+                new NettyRpcServerHandler(
+                        requestHandler,
+                        tracker,
+                        ignoredTask -> {
+                            throw new RejectedExecutionException("full");
+                        }
+                )
+        );
+
+        try {
+            channel.writeInbound(request);
+
+            RpcResponse response = channel.readOutbound();
+            assertEquals(303L, response.getRequestId());
+            assertEquals(RpcResponse.FAILURE_CODE, response.getCode());
+            assertEquals(0, tracker.getInFlightRequestCount());
+            verifyNoInteractions(requestHandler);
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldSubmitBusinessWorkInsteadOfRunningItInChannelRead() {
+        RpcRequest request = RpcRequest.builder()
+                .requestId(404L)
+                .build();
+        RpcResponse expectedResponse = RpcResponse.success(404L, "async");
+        RpcRequestHandler requestHandler = mock(RpcRequestHandler.class);
+        when(requestHandler.handle(request)).thenReturn(expectedResponse);
+        InFlightRequestTracker tracker = new InFlightRequestTracker();
+        AtomicReference<Runnable> submittedTask = new AtomicReference<>();
+        EmbeddedChannel channel = new EmbeddedChannel(
+                new NettyRpcServerHandler(
+                        requestHandler,
+                        tracker,
+                        task -> {
+                            if (!submittedTask.compareAndSet(null, task)) {
+                                throw new AssertionError("只应提交一个业务任务");
+                            }
+                        }
+                )
+        );
+
+        try {
+            channel.writeInbound(request);
+
+            assertNotNull(submittedTask.get());
+            assertNull(channel.readOutbound(),
+                    "任务尚未执行时不应提前产生响应");
+            assertEquals(1, tracker.getInFlightRequestCount());
+            verifyNoInteractions(requestHandler);
+
+            submittedTask.get().run();
+            channel.runPendingTasks();
+
+            assertEquals(expectedResponse, channel.readOutbound());
+            assertEquals(0, tracker.getInFlightRequestCount());
+            verify(requestHandler).handle(request);
         } finally {
             channel.finishAndReleaseAll();
         }

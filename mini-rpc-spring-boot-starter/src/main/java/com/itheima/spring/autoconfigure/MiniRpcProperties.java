@@ -1,5 +1,6 @@
 package com.itheima.spring.autoconfigure;
 
+import com.itheima.transport.server.NettyRpcServer;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
@@ -20,13 +21,15 @@ import java.time.Duration;
  *   provider-enabled: false
  *   server-host: 127.0.0.1
  *   server-port: 8080
+ *   provider-business-threads: 8
+ *   provider-business-queue-capacity: 1024
  * }</pre>
  *
  * <p>自动绑定到本类的各个字段。这里的“绑定”可以简单理解为：Spring 读取
  * 配置文件，然后调用对应的 setter 把值写入 Java 对象。</p>
  *
  * <p>目前注册中心地址、请求超时、关闭排空超时、策略选择、Provider 开关、
- * 主机和端口都已经接入自动配置。</p>
+ * 主机、端口和 Provider 业务线程池参数都已经接入自动配置。</p>
  */
 @ConfigurationProperties(prefix = "mini-rpc")
 public class MiniRpcProperties {
@@ -57,6 +60,14 @@ public class MiniRpcProperties {
 
     /** Provider 对外监听的 Netty 端口。 */
     private int serverPort = 8080;
+
+    /** Provider 执行 @RpcService 方法的固定业务线程数。 */
+    private int providerBusinessThreads =
+            NettyRpcServer.DEFAULT_BUSINESS_THREAD_COUNT;
+
+    /** Provider 业务线程全部忙碌时，最多允许多少个请求排队。 */
+    private int providerBusinessQueueCapacity =
+            NettyRpcServer.DEFAULT_BUSINESS_QUEUE_CAPACITY;
 
     public boolean isEnabled() {
         return enabled;
@@ -128,6 +139,24 @@ public class MiniRpcProperties {
 
     public void setServerPort(int serverPort) {
         this.serverPort = serverPort;
+    }
+
+    public int getProviderBusinessThreads() {
+        return providerBusinessThreads;
+    }
+
+    public void setProviderBusinessThreads(int providerBusinessThreads) {
+        this.providerBusinessThreads = providerBusinessThreads;
+    }
+
+    public int getProviderBusinessQueueCapacity() {
+        return providerBusinessQueueCapacity;
+    }
+
+    public void setProviderBusinessQueueCapacity(
+            int providerBusinessQueueCapacity
+    ) {
+        this.providerBusinessQueueCapacity = providerBusinessQueueCapacity;
     }
 
     /** Starter 当前内置的序列化器名称。 */

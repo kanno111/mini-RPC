@@ -5,6 +5,7 @@ import com.itheima.common.RpcResponse;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -60,6 +61,34 @@ class RpcRequestHandlerDeadlineTest {
         assertEquals(RpcResponse.SUCCESS_CODE, response.getCode());
         assertEquals("hello", response.getData());
         verify(serviceProvider).getService(GreetingService.class.getName());
+    }
+
+    @Test
+    void shouldExposeDeadlineOnlyWhileServiceMethodIsRunning() {
+        ServiceProvider serviceProvider = mock(ServiceProvider.class);
+        long deadlineEpochMillis = System.currentTimeMillis() + 10_000;
+        GreetingService service = () -> RpcCallContext.getRequestId()
+                + ":" + RpcCallContext.getDeadlineEpochMillis();
+        when(serviceProvider.getService(GreetingService.class.getName()))
+                .thenReturn(service);
+        RpcRequestHandler requestHandler =
+                new RpcRequestHandler(serviceProvider);
+        RpcRequest request = RpcRequest.builder()
+                .requestId(303L)
+                .interfaceName(GreetingService.class.getName())
+                .methodName("hello")
+                .parameterTypes(new Class<?>[0])
+                .parameters(new Object[0])
+                .version("1.0")
+                .deadlineEpochMillis(deadlineEpochMillis)
+                .build();
+
+        RpcResponse response = requestHandler.handle(request);
+
+        assertEquals(RpcResponse.SUCCESS_CODE, response.getCode());
+        assertEquals("303:" + deadlineEpochMillis, response.getData());
+        assertFalse(RpcCallContext.hasContext(),
+                "服务方法结束后必须清理 ThreadLocal 上下文");
     }
 
     /** 测试接口同时充当 Class.forName() 和反射方法查找使用的服务契约。 */

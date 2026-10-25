@@ -139,9 +139,9 @@ public final class RpcProvider implements AutoCloseable {
     /**
      * 使用指定序列化器和关闭排空时间创建 Provider。
      *
-     * <p>Starter 使用这个构造方法把 {@code mini-rpc.shutdown-timeout} 一直传到
-     * Netty 服务端。超时只控制关闭时等待已开始请求的时间，不影响普通 RPC 请求
-     * 的 Consumer 响应超时。</p>
+     * <p>这个兼容构造方法允许只指定 {@code mini-rpc.shutdown-timeout}，业务线程池
+     * 继续使用框架默认容量。Starter 当前会使用下面的完整构造方法继续传递线程池
+     * 配置。排空超时不影响普通 RPC 请求的 Consumer 响应超时。</p>
      */
     public RpcProvider(
             String host,
@@ -149,6 +149,32 @@ public final class RpcProvider implements AutoCloseable {
             String zooKeeperAddress,
             Serializer serializer,
             Duration shutdownTimeout
+    ) {
+        this(
+                host,
+                port,
+                zooKeeperAddress,
+                serializer,
+                shutdownTimeout,
+                NettyRpcServer.DEFAULT_BUSINESS_THREAD_COUNT,
+                NettyRpcServer.DEFAULT_BUSINESS_QUEUE_CAPACITY
+        );
+    }
+
+    /**
+     * 使用完整的 Provider 网络、关闭和业务线程池配置创建实例。
+     *
+     * <p>Starter 通过这个构造方法把 application.yml 中的线程数和队列容量传到
+     * Netty 服务端；业务应用仍然不需要手动创建线程池。</p>
+     */
+    public RpcProvider(
+            String host,
+            int port,
+            String zooKeeperAddress,
+            Serializer serializer,
+            Duration shutdownTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
     ) {
         this.serviceAddress = new ServiceAddress(host, port);
         this.serviceProvider = new DefaultServiceProvider();
@@ -159,7 +185,9 @@ public final class RpcProvider implements AutoCloseable {
                 port,
                 serializer,
                 requestHandler,
-                shutdownTimeout
+                shutdownTimeout,
+                businessThreadCount,
+                businessQueueCapacity
         );
         this.serviceRegistry =
                 new ZooKeeperServiceRegistry(zooKeeperAddress);

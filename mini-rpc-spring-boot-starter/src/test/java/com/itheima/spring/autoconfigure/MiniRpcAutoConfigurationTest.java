@@ -56,7 +56,9 @@ class MiniRpcAutoConfigurationTest {
                         "mini-rpc.shutdown-timeout=12s",
                         "mini-rpc.serializer=jdk",
                         "mini-rpc.load-balance=random",
-                        "mini-rpc.server-port=9090"
+                        "mini-rpc.server-port=9090",
+                        "mini-rpc.provider-business-threads=6",
+                        "mini-rpc.provider-business-queue-capacity=300"
                 )
                 .run(context -> {
                     assertThat(context)
@@ -81,6 +83,11 @@ class MiniRpcAutoConfigurationTest {
                             );
                     assertThat(properties.getServerPort())
                             .isEqualTo(9090);
+                    assertThat(properties.getProviderBusinessThreads())
+                            .isEqualTo(6);
+                    assertThat(
+                            properties.getProviderBusinessQueueCapacity()
+                    ).isEqualTo(300);
                 });
     }
 

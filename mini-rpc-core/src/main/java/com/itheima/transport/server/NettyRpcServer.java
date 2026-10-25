@@ -30,11 +30,13 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  * bossGroup：接收新连接
  *      ↓
- * workerGroup：处理连接上的读写事件
+ * workerGroup：处理连接上的解码、编码和读写事件
  *      ↓
  * 每条连接自己的 Pipeline
  *      ↓
  * RpcDecoder → RpcEncoder → NettyRpcServerHandler
+ *      ↓
+ * ProviderBusinessExecutor：执行服务查找和业务方法
  * </pre>
  */
 public class NettyRpcServer implements RpcServer {
@@ -44,6 +46,15 @@ public class NettyRpcServer implements RpcServer {
     /** Provider 默认最多等待 10 秒，让关闭前已经开始的请求完成响应。 */
     public static final Duration DEFAULT_SHUTDOWN_TIMEOUT =
             Duration.ofSeconds(10);
+
+    /** 默认业务线程数：至少 2 个，并随运行机器的可用处理器数量增加。 */
+    public static final int DEFAULT_BUSINESS_THREAD_COUNT = Math.max(
+            2,
+            Runtime.getRuntime().availableProcessors()
+    );
+
+    /** 默认最多允许 1,024 个业务请求在有界队列中等待执行。 */
+    public static final int DEFAULT_BUSINESS_QUEUE_CAPACITY = 1_024;
 
     /** 服务端要监听的端口。 */
     private final int port;
@@ -60,13 +71,16 @@ public class NettyRpcServer implements RpcServer {
     /** 服务端和业务 Handler 共享的在途请求计数器。 */
     private final InFlightRequestTracker requestTracker;
 
+    /** 独立执行 @RpcService 方法，避免耗时业务阻塞 Netty worker EventLoop。 */
+    private final ProviderBusinessExecutor businessExecutor;
+
     /**
      * boss 线程组只负责接受新连接，不执行具体请求。
      * 一个监听端口只需要一个 boss 线程。
      */
     private EventLoopGroup bossGroup;
 
-    /** worker 线程组负责已经建立连接上的读取、解码、处理和写回。 */
+    /** worker 线程组负责已建立连接的网络读写和编解码，不再执行耗时业务方法。 */
     private EventLoopGroup workerGroup;
 
     /** 代表服务端监听端口的 Channel，不是某个具体客户端的 Channel。 */
@@ -94,7 +108,9 @@ public class NettyRpcServer implements RpcServer {
                 port,
                 serializer,
                 requestHandler,
-                DEFAULT_SHUTDOWN_TIMEOUT
+                DEFAULT_SHUTDOWN_TIMEOUT,
+                DEFAULT_BUSINESS_THREAD_COUNT,
+                DEFAULT_BUSINESS_QUEUE_CAPACITY
         );
     }
 
@@ -108,6 +124,30 @@ public class NettyRpcServer implements RpcServer {
             Serializer serializer,
             RpcRequestHandler requestHandler,
             Duration shutdownTimeout
+    ) {
+        this(
+                port,
+                serializer,
+                requestHandler,
+                shutdownTimeout,
+                DEFAULT_BUSINESS_THREAD_COUNT,
+                DEFAULT_BUSINESS_QUEUE_CAPACITY
+        );
+    }
+
+    /**
+     * 创建可以明确控制业务线程数和排队上限的 Netty RPC 服务端。
+     *
+     * @param businessThreadCount  Provider 固定业务线程数
+     * @param businessQueueCapacity Provider 业务任务等待队列容量
+     */
+    public NettyRpcServer(
+            int port,
+            Serializer serializer,
+            RpcRequestHandler requestHandler,
+            Duration shutdownTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
     ) {
         if (port < 1 || port > 65535) {
             throw new RpcException("RPC 服务端端口必须在 1 到 65535 之间：" + port);
@@ -124,9 +164,14 @@ public class NettyRpcServer implements RpcServer {
         this.serializer = serializer;
         this.shutdownTimeout = shutdownTimeout;
         this.requestTracker = new InFlightRequestTracker();
+        this.businessExecutor = new ProviderBusinessExecutor(
+                businessThreadCount,
+                businessQueueCapacity
+        );
         this.serverHandler = new NettyRpcServerHandler(
                 requestHandler,
-                requestTracker
+                requestTracker,
+                businessExecutor
         );
     }
 
@@ -246,7 +291,7 @@ public class NettyRpcServer implements RpcServer {
                 .addLast(new RpcDecoder())
                 // 出站：把 RpcResponse 编码成“20 字节协议头 + 正文”。
                 .addLast(new RpcEncoder(serializer))
-                // 入站：执行请求并写回响应。
+                // 入站：把请求分发到业务线程池，完成后再写回响应。
                 .addLast(serverHandler);
     }
 
@@ -254,9 +299,8 @@ public class NettyRpcServer implements RpcServer {
      * 停止监听，并优雅关闭 boss、worker 线程组。
      *
      * <p>方法允许重复调用。关闭监听 Channel 后，阻塞在 start() 中的
-     * {@code closeFuture().sync()} 会被唤醒。workerGroup 使用 Netty 的
-     * {@code shutdownGracefully()}：已经进入 EventLoop 的请求任务可以先执行完，
-     * 当前线程会等待线程组真正终止后再返回。</p>
+     * {@code closeFuture().sync()} 会被唤醒。关闭线程先等待业务线程池中的在途
+     * 请求完成，再关闭业务线程池以及 Netty boss、worker 线程组。</p>
      */
     @Override
     public void stop() {
@@ -296,6 +340,13 @@ public class NettyRpcServer implements RpcServer {
                     shutdownTimeout.toMillis()
             );
         }
+
+        /*
+         * 排空成功表示业务任务和响应写入都已完成，可以正常 shutdown；排空超时
+         * 则调用 shutdownNow() 向仍在执行的业务线程发出中断。Java 无法安全强杀
+         * 忽略中断的用户代码，因此这里不会无限等待线程池终止。
+         */
+        businessExecutor.shutdown(drained);
 
         long shutdownTimeoutMillis = shutdownTimeout.toMillis();
         if (bossToShutdown != null) {
