@@ -68,6 +68,8 @@ JDK 动态代理
 | S5-I-B-A | Consumer 写空闲心跳与读空闲断连 | 已完成 |
 | S5-I-B-B | Consumer 心跳时间 Starter 配置化 | 已完成 |
 | S5-I-C | Provider 静默客户端 Channel 清理 | 已完成 |
+| S5-I-D-A | 真实 Netty PING/PONG 往返集成测试 | 已完成 |
+| S5-I-D-B | 心跳超时断连与按需重连集成测试 | 已完成 |
 | M5 | SPI、重试、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -873,6 +875,18 @@ Provider 也会为每条已接受的客户端 Channel 安装独立读空闲检�
 都会证明客户端仍然存活；如果默认 60 秒内没有收到任何入站数据，Provider 只关闭
 这条静默子 Channel，不会关闭监听端口、其他客户端连接或业务线程池。
 
+`NettyHeartbeatRoundTripIntegrationTest` 会在本机随机端口启动真实
+Netty Provider 和 Consumer，使用短心跳参数验证“写空闲 → PING →
+PONG”后 Channel 仍然存活，且后续 RPC 仍能正常执行。该测试不依赖
+ZooKeeper 或 Docker，它聚焦验证 Netty Pipeline、协议编解码和心跳空闲计时
+能否在真实 TCP 连接上协同工作。
+
+`NettyHeartbeatTimeoutReconnectIntegrationTest` 则使用只存在于测试源集的
+故障注入 Provider：它正常处理业务请求，但第一阶段故意丢弃 PING。
+测试验证 Consumer 读空闲超时后会关闭旧 Channel，不会在后台无限重连；
+当 PONG 恢复且下一次 RPC 到来时，客户端才建立新 Channel，后续调用
+会继续复用这条恢复后的连接。故障开关没有进入生产代码或 Starter 配置。
+
 ---
 
 ## 9. 本地运行
@@ -1055,9 +1069,9 @@ mini-rpc-example-consumer
 
 Spring 基础链路和第一批配置能力已经完整跑通。接下来优先提高运行可靠性：
 
-1. 为心跳与断线重连补充真实 Netty 集成测试，验证空闲事件、Channel 关闭和下一次
-   调用重连的完整链路；
-2. 再逐步加入有限重试、SPI 和更多策略配置；
+1. 先设计有限重试的边界：只重试明确尚未执行的连接/写入失败，
+   避免已经到达 Provider 的非幂等请求被重复执行；
+2. 再逐步加入 SPI 和更多策略配置；
 3. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
    执行前检查与协作式检查，因此暂缓到确有需求时再实现，避免过度设计。
 

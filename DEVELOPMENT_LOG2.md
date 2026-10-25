@@ -561,3 +561,162 @@ PONG”。心跳发送频率、协议和连接生命周期都没有变化。
 - Provider 正常回复 PONG 暂时没有独立日志，但 Consumer 收到 PONG 已能
   证明完整往返链路；
 - 下一步仍建议实现 S5-I-D 真实 Netty 心跳生命周期集成测试。
+
+### 3.36 S5-I-D-A：真实 Netty PING/PONG 往返集成测试
+
+- 日期：2026-10-25
+- 对应提交：本次真实 Netty 心跳生命周期测试阶段提交
+- 状态：已实现并验证
+
+#### 目标
+
+不再只依赖 `EmbeddedChannel` 分别测试心跳 Handler，而是启动真实
+Netty Provider 和 Consumer，自动证明协议编解码、Pipeline 顺序、空闲事件
+和 PING/PONG Handler 能在操作系统 TCP 连接上完整协作。
+
+#### 主要修改
+
+- 新增 `NettyHeartbeatRoundTripIntegrationTest`；
+- 通过本机随机端口启动真实 `NettyRpcServer`，避免占用示例的
+  8080 端口；
+- 使用固定地址解析器将 `NettyRpcClient` 直接指向测试 Provider，
+  不引入 ZooKeeper 或 Docker；
+- 心跳间隔缩短为 100ms，Consumer 读空闲超时设为 600ms，
+  Provider 读空闲设为 2s；
+- 在 1.3s 观察窗口内反复检查 Channel 存活，然后再次发起真实
+  RPC 并验证 Provider 业务方法共执行两次。
+
+#### 行为变化与调用链
+
+本步只增加测试和文档，不改变生产运行行为。测试覆盖的真实链路是：
+
+```text
+第一次 RPC 调用
+        ↓
+建立真实 TCP Channel 并完成请求/响应
+        ↓
+停止发送业务请求
+        ↓
+Consumer 100ms 写空闲 → PING
+        ↓
+Provider 解码 PING → 返回 PONG
+        ↓
+Consumer 收到 PONG 并刷新读空闲计时
+        ↓
+连续 1.3s 观察期间 Channel 始终存活
+        ↓
+第二次 RPC 调用仍成功
+```
+
+#### 设计原因
+
+- 不使用 ZooKeeper，使失败范围聚焦在 Netty 和心跳链路，同时让没有
+  Docker 的开发机和 CI 也能执行；
+- 观察窗口大于两倍 Consumer 读超时：如果 PING/PONG 没有往返，
+  Channel 会在测试结束前被关闭；
+- 观察期间不发业务请求，避免普通响应刷新读计时，确保连接
+  存活确实来自 PONG；
+- 不为了测试暴露生产 Channel 或增加测试钩子，使用已有
+  `isConnected()` 与第二次 RPC 证明连接和业务链路都正常；
+- 本步只测正常往返，将超时断连和重连留给下一个小步骤，
+  避免一个测试同时包含太多状态转换。
+
+#### 验证方式
+
+- 执行
+  `mvn -q -pl mini-rpc-core -Dtest=NettyHeartbeatRoundTripIntegrationTest test`；
+- 新测试通过：首次 RPC、1.3s Channel 存活观察、第二次 RPC 与
+  Provider 执行次数断言均成功。
+- 执行根工程 `mvn test`，core 51 个测试全部通过，包含新心跳测试与
+  Testcontainers 端到端测试；Starter 12 个测试全部通过，六个 Maven
+  模块全部构建成功。
+
+#### 当前限制与下一步
+
+- 当前用例验证了正常 PING/PONG 保活，尚未覆盖 Provider 不回 PONG
+  的静默故障；
+- `isConnected()` 只表示客户端当前存在活跃 Channel，不是生产级心跳
+  计数器或可观测指标；
+- 下一步建议实现 S5-I-D-B：真实验证心跳超时关闭旧 Channel，
+  以及 Provider 恢复后下一次 RPC 建立新连接。
+
+### 3.37 S5-I-D-B：心跳超时断连与按需重连集成测试
+
+- 日期：2026-10-25
+- 对应提交：本次真实 Netty 心跳生命周期测试阶段提交
+- 状态：已实现并验证
+
+#### 目标
+
+在真实 TCP 连接上验证心跳故障分支：Provider 长期不回 PONG 时，
+Consumer 应在读空闲超时后关闭并移除旧 Channel；当 Provider 恢复且
+下一次 RPC 到来时，Consumer 应按需建立新 Channel，而不是在无业务
+请求时不断后台重连。
+
+#### 主要修改
+
+- 新增 `NettyHeartbeatTimeoutReconnectIntegrationTest`；
+- 在测试源集中实现最小 `FaultInjectingHeartbeatServer`，复用生产
+  `RpcDecoder` 和 `RpcEncoder`；
+- 故障注入服务端始终回复普通 `RpcRequest`，但第一阶段故意
+  丢弃 PING，用计数器记录连接、断连、PING、PONG 和业务请求；
+- Consumer 使用 100ms 心跳间隔和 600ms 读空闲超时；
+- 故障恢复后再观察 1.3s，验证新 Channel 会因 PONG 持续到达而保持
+  存活，并被第三次 RPC 复用。
+
+#### 行为变化与调用链
+
+本步仍只新增测试和文档，不修改生产运行行为，也没有向 Starter
+增加故障开关。测试覆盖的状态转换是：
+
+```text
+第一次 RPC 建立 Channel-1 并成功返回
+        ↓
+Consumer 写空闲后发送 PING
+        ↓
+测试 Provider 故意丢弃 PING
+        ↓
+Consumer 600ms 未收到任何数据
+        ↓
+READER_IDLE 关闭 Channel-1，连接缓存移除旧 Channel
+        ↓
+测试 Provider 恢复回复 PONG
+        ↓
+第二次 RPC 到来时建立 Channel-2
+        ↓
+Channel-2 通过 PING/PONG 持续存活
+        ↓
+第三次 RPC 复用 Channel-2
+```
+
+#### 设计原因
+
+- 不修改生产 `NettyRpcServer` 来关闭 PONG，避免为测试暴露危险配置；
+- 故障服务端仍使用真实 Netty、TCP 和生产协议编解码，不是
+  `EmbeddedChannel` 或 Mockito 模拟；
+- 故障期仍正常回复普通 RPC，能把“服务不可用”与“心跳回复静默”
+  区分开；
+- 等待断连使用有上限的条件轮询，条件成立立即继续，不用固定
+  长时间 sleep 猜测异步事件何时完成；
+- 连接超时后不主动后台重连，等待下一次真实请求再建连，避免
+  Provider 故障时大量 Consumer 形成无限重连风暴。
+
+#### 验证方式
+
+- 执行
+  `mvn -q -pl mini-rpc-core -Dtest=NettyHeartbeatTimeoutReconnectIntegrationTest test`；
+- 新测试通过：观察到至少一次被丢弃的 PING、Channel-1 超时关闭、
+  Channel-2 新建、恢复后 PONG 到达，以及第三次 RPC 复用 Channel-2。
+- 执行根工程 `mvn test`，core 52 个测试全部通过，包含两个真实
+  Netty 心跳集成测试和 Testcontainers 端到端测试；Starter 12 个
+  测试全部通过，六个 Maven 模块全部构建成功。
+
+#### 当前限制与下一步
+
+- 故障注入 Provider 是测试夹具，不会验证生产 Provider 的业务线程池；
+  生产 Provider 的正常 PONG 往返已由 S5-I-D-A 覆盖；
+- 当前的“重连”指旧 Channel 失效后，下一次业务调用新建 Channel，
+  不是后台定时无限重连；
+- 框架仍没有“失败后自动重试当前 RPC”，这与连接重建是两个不同概念；
+- 下一步建议进入 M5-A：先定义只针对“明确未到达 Provider”失败的
+  有限重试边界，避免非幂等业务被重复执行。
