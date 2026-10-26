@@ -1483,3 +1483,99 @@ Provider 请求已经过期时，不进入任何用户 Filter；未过期时才�
 - 旧 Socket 教学入口仍直接调用 `RpcRequestHandler`，不经过 Netty Provider 链；
 - 下一步建议进入 R3-A：基于现有 Filter 链增加最小 Micrometer 指标，先统计
   Consumer/Provider 请求总数、成功/失败和调用耗时，不同时加入追踪、熔断等功能。
+
+### 3.47 R3-A：Consumer/Provider 最小 Micrometer 指标
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+复用 R2 已建立的两侧 Filter 链，为每次真实 RPC 调用记录最基础、可自动装配的
+Micrometer 指标：Consumer/Provider 请求总数、成功数、失败数和耗时。本步只使用
+JVM 内存注册表验证采集语义，不同时接入 Actuator、Prometheus、Grafana、追踪、
+熔断、重试或线程池 Gauge。
+
+#### 主要修改
+
+- `mini-rpc-core` 增加 `micrometer-core` 依赖，版本由父工程已有的 Spring Boot BOM
+  统一管理；core 不依赖 Actuator 或具体监控后端；
+- 新增 `ConsumerMetricsFilter`，记录 `mini.rpc.consumer.requests`、成功/失败计数和
+  `mini.rpc.consumer.duration`；网络异常、超时和后续 Filter 抛出的运行时异常同样
+  计为失败，并保持原异常对象继续传播；
+- 新增 `ProviderMetricsFilter`，记录 `mini.rpc.provider.requests`、成功/失败计数和
+  `mini.rpc.provider.duration`；失败响应和业务链直接抛出的异常均计为失败；
+- 两个 Filter 都使用 Micrometer 线程安全的 `Counter`/`Timer`，单次请求的
+  `Timer.Sample` 只保存在方法局部变量中；无论成功、失败响应还是异常都会在
+  `finally` 中停止计时；
+- Starter 在业务未提供 `MeterRegistry` 时自动创建 `SimpleMeterRegistry`；业务声明
+  自己的注册表 Bean 时，默认实现通过 `@ConditionalOnMissingBean` 自动让位；
+- Starter 自动注册两侧指标 Filter，并使用最高 Spring 顺序包住全部用户 Filter；
+  core 原有组装规则继续保证 `ProviderDeadlineFilter` 固定在 Provider 指标之前；
+- 新增两侧指标单元测试和 Starter 自动配置测试，使用 `MockClock` 精确验证计时，
+  同时验证默认注册表、自定义注册表让位以及内置 Filter 的顺序；
+- README 同步更新完成度、包结构、指标名称、调用链、当前限制和下一步。
+
+#### 行为变化与调用链
+
+Consumer：
+
+```text
+@RpcReference 动态代理
+    → ConsumerMetricsFilter（请求总数 + 开始计时）
+    → 用户 ConsumerFilter
+    → 服务发现、建连、发送并等待 RpcResponse
+    → 按响应码记录成功/失败，或把抛出的异常记为失败
+    → 停止计时
+```
+
+因此 Consumer 耗时覆盖一次调用的完整远程路径，而不只是 Netty 写操作。
+
+Provider：
+
+```text
+Provider 业务线程
+    → ProviderDeadlineFilter
+    → ProviderMetricsFilter（请求总数 + 开始计时）
+    → 用户 ProviderFilter
+    → RpcRequestHandler → @RpcService 方法
+    → 记录响应结果并停止计时
+```
+
+已过 deadline 的请求在第一个 Filter 就被短路，不会计入“实际进入 Provider 业务链”
+的指标。正常进入业务链后，用户 Filter 和服务方法的执行时间都会计入 Provider 耗时。
+
+#### 设计原因
+
+- 指标是围绕调用的横切逻辑，复用已验证的 Filter 扩展点可以避免把计数代码散落到
+  动态代理、Netty Handler 和反射处理器中；
+- Consumer 指标放在用户链最外层，才能得到调用方真实感受到的完整耗时；Provider
+  指标放在 deadline 之后，避免把没有执行业务价值的过期请求混入业务处理数据；
+- 成功/失败以最终 `RpcResponse.code` 为准，链直接抛出异常时再走异常分支，保持
+  指标分类与调用方看到的结果一致；
+- 默认使用 `SimpleMeterRegistry`，让当前阶段无需外部服务即可学习和测试 Micrometer；
+  同时依赖 `MeterRegistry` 抽象，为后续替换成 Actuator/Prometheus 注册表保留入口；
+- 本步使用固定聚合指标名，不加入接口、方法、group/version 等标签，先避免高基数
+  标签和指标数量膨胀问题，后续有明确查询需求时再设计标签边界。
+
+#### 验证方式
+
+- 定向执行 `ConsumerMetricsFilterTest` 和 `ProviderMetricsFilterTest`，4 个测试全部
+  通过；验证成功响应、失败响应、异常传播、请求计数和确定的模拟时钟耗时；
+- 定向执行 `MiniRpcAutoConfigurationTest`，验证默认内存注册表、自定义注册表让位、
+  两侧指标 Filter 自动创建和排序，全部通过；
+- 执行根目录 `mvn clean test`，六个 Maven 模块全部构建成功；core 73 个测试中
+  71 个通过、2 个依赖 Docker 的 ZooKeeper 端到端测试跳过，Starter 16 个测试
+  全部通过，总计 87 个通过、2 个跳过，0 失败、0 错误；
+- Mockito 仍会提示动态加载 Java Agent 的未来兼容性警告，不影响当前测试结果。
+
+#### 当前限制和下一步
+
+- 默认 `SimpleMeterRegistry` 的数据只存在于当前 JVM，应用重启后清空，也没有 HTTP
+  查询端点；当前没有接入 Actuator、Prometheus Registry、Prometheus 或 Grafana；
+- 指标当前按 Consumer/Provider 两侧聚合，没有接口、方法、group/version 标签；
+- 尚未提供 Provider 在途请求、业务线程池活跃线程、队列长度和拒绝次数 Gauge；
+- 旧 Socket 教学入口不经过 Netty Provider Filter 链，因此不会记录 Provider 指标；
+- 下一步建议单独实施 R3-B：为现有 `InFlightRequestTracker` 和
+  `ProviderBusinessExecutor` 增加只读 Gauge，不在同一步部署监控基础设施。

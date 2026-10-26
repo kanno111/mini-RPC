@@ -4,22 +4,28 @@ import io.github.kaano.minirpc.client.RpcClientFactory;
 import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
+import io.github.kaano.minirpc.metrics.ConsumerMetricsFilter;
+import io.github.kaano.minirpc.metrics.ProviderMetricsFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
 import io.github.kaano.minirpc.serialize.JdkSerializer;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
 import io.github.kaano.minirpc.serialize.Serializer;
 import io.github.kaano.minirpc.server.RpcProvider;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 
 import java.util.List;
 
@@ -30,7 +36,7 @@ import java.util.List;
  * {@code AutoConfiguration.imports} 找到本类，不需要业务方手动写
  * {@code @Import(MiniRpcAutoConfiguration.class)}。</p>
  *
- * <p>本类目前完成六项装配：</p>
+ * <p>本类目前完成七项装配：</p>
  *
  * <ol>
  *     <li>让 {@link MiniRpcProperties} 成为 Spring 管理的配置 Bean；</li>
@@ -39,6 +45,7 @@ import java.util.List;
  *     <li>把 {@code @RpcService} 类注册成真正的 Spring Bean；</li>
  *     <li>让 {@link RpcProvider} 随 Spring 容器自动启动和关闭。</li>
  *     <li>收集 Consumer/Provider Filter Bean，并按 Spring 顺序规则交给 core。</li>
+ *     <li>注册内存指标表和两侧 Micrometer 指标 Filter。</li>
  * </ol>
  *
  * <p>“延迟创建”表示仅仅启动 Spring 容器时不会连接 ZooKeeper。等后续真的有
@@ -53,6 +60,50 @@ import java.util.List;
         matchIfMissing = true
 )
 public class MiniRpcAutoConfiguration {
+
+    /**
+     * 提供不依赖监控服务器的默认 Micrometer 注册表。
+     *
+     * <p>{@link SimpleMeterRegistry} 只把指标保存在当前 JVM 内存中，适合本地学习和
+     * 单元测试，不会开放 HTTP 端点，也不会把数据发送到 Prometheus。业务应用如果
+     * 声明了自己的 {@link MeterRegistry}，这里会自动让位，两个指标 Filter 将复用
+     * 业务提供的注册表。</p>
+     */
+    @Bean
+    @ConditionalOnMissingBean(MeterRegistry.class)
+    public MeterRegistry rpcMeterRegistry() {
+        return new SimpleMeterRegistry();
+    }
+
+    /**
+     * 注册 Consumer 内置指标 Filter，并把它排在用户 Filter 之前。
+     *
+     * <p>这样计时范围能够包住后续用户 Filter 与完整网络调用。使用具体类型作为
+     * 缺失条件，既允许业务覆盖这一内置实现，也不会因普通用户 Filter 存在而退出。</p>
+     */
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    @ConditionalOnMissingBean(ConsumerMetricsFilter.class)
+    public ConsumerMetricsFilter consumerMetricsFilter(
+            MeterRegistry meterRegistry
+    ) {
+        return new ConsumerMetricsFilter(meterRegistry);
+    }
+
+    /**
+     * 注册 Provider 内置指标 Filter，并把它排在全部用户 Provider Filter 之前。
+     *
+     * <p>core 在组装真实 Provider 调用链时仍会把 deadline Filter 固定放在最前面，
+     * 所以过期请求不会进入本指标 Filter，也不会被误算为实际业务处理请求。</p>
+     */
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    @ConditionalOnMissingBean(ProviderMetricsFilter.class)
+    public ProviderMetricsFilter providerMetricsFilter(
+            MeterRegistry meterRegistry
+    ) {
+        return new ProviderMetricsFilter(meterRegistry);
+    }
 
     /**
      * 根据配置创建正文序列化器。

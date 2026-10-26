@@ -28,6 +28,7 @@ JDK 动态代理
     + Round Robin 轮询负载均衡
     + Spring Boot Starter 自动装配
     + @RpcService / @RpcReference 自动处理
+    + Micrometer Consumer/Provider 基础指标
 ```
 
 早期实现的 Socket 通信和 JDK 序列化代码仍然保留在 core 模块中，用来对比
@@ -73,6 +74,8 @@ JDK 动态代理
 | R1-A | ServiceKey 与 Provider 本地版本/分组路由 | 已完成 |
 | R1-B | `@RpcService` / `@RpcReference` 版本与分组传递 | 已完成 |
 | R1-C | ZooKeeper、缓存、Watch 与负载均衡接入 ServiceKey | 已完成 |
+| R2-A～R2-D | Consumer/Provider Filter 链与 Starter 自动收集 | 已完成 |
+| R3-A | Consumer/Provider Micrometer 请求、结果和耗时指标 | 已完成基础版本 |
 | M5 | SPI、重试、熔断、更多序列化等 | 尚未开始 |
 
 详细的分阶段原始规划参见 [process.md](process.md)，实际演进记录参见
@@ -163,7 +166,7 @@ Provider、Consumer 和共享 API 模块应一起升级。
 ### 3.2 mini-rpc-core
 
 这是框架主体，包含协议、序列化、动态代理、网络通信、注册中心、负载均衡、
-服务扫描以及服务端和客户端的高层入口。
+服务扫描、Micrometer 基础指标以及服务端和客户端的高层入口。
 
 非 Spring 项目可以直接依赖这个模块；Spring Boot 业务项目应优先依赖 Starter。
 
@@ -177,6 +180,7 @@ Provider、Consumer 和共享 API 模块应一起升级。
 - `RpcServiceBeanDefinitionRegistryPostProcessor`：扫描 `@RpcService` 并注册
   BeanDefinition；
 - `SpringRpcProviderLifecycle`：注册 Spring 服务对象，并管理 Provider 的启动关闭；
+- `SimpleMeterRegistry` 与内置指标 Filter：默认在当前 JVM 内存中保存 RPC 指标；
 - `AutoConfiguration.imports`：让 Spring Boot 能自动发现配置入口；
 - 自动配置、延迟创建和服务扫描测试。
 
@@ -358,6 +362,7 @@ io.github.kaano.minirpc
 ├── cluster        服务发现和负载均衡的组合层
 ├── common         RPC 公共数据模型和协议常量
 ├── loadbalance    负载均衡抽象与实现
+├── metrics        Consumer/Provider Micrometer 基础指标 Filter
 ├── provider       服务端本地服务表、Provider Filter 和反射调用
 ├── proxy          客户端动态代理和 Consumer Filter
 ├── registry       注册中心抽象、地址模型和 ZooKeeper 实现
@@ -436,8 +441,9 @@ helloService.sayHello(...)
 Filter 可围绕网络调用执行前置/后置逻辑，也可返回失败响应，阻止真正发送。
 业务项目只需把 `ConsumerFilter` 实现声明为 Spring Bean；Starter 会通过
 `ObjectProvider.orderedStream()` 收集全部实现，并把不可变顺序快照交给 core。
-数值更小的 `@Order` 会更早执行前置逻辑、更晚执行后置逻辑。没有声明 Filter Bean
-时使用空链，单引用 timeout 仍传给 `RpcClient` 的带 `Duration` 重载。
+数值更小的 `@Order` 会更早执行前置逻辑、更晚执行后置逻辑。R3-A 加入的内置
+`ConsumerMetricsFilter` 固定先于用户 Filter；没有声明用户 Filter Bean 时仍会经过
+指标 Filter，单引用 timeout 继续传给 `RpcClient` 的带 `Duration` 重载。
 
 ```java
 @Component
@@ -520,6 +526,7 @@ R2-D 中 Starter 也会自动收集 `ProviderFilter` Spring Bean。Provider 的�
 ```text
 NettyRpcServerHandler → ProviderBusinessExecutor
     → ProviderDeadlineFilter
+    → ProviderMetricsFilter
     → 用户 ProviderFilter（按 Spring @Order 排序）
     → RpcRequestHandler → @RpcService 方法
 ```
@@ -741,6 +748,29 @@ RpcEncoder
 网络字节
 ```
 
+### 4.12 metrics：基础调用指标
+
+Starter 会自动创建 `ConsumerMetricsFilter` 和 `ProviderMetricsFilter`，两者复用同一个
+`MeterRegistry`。Consumer 指标 Filter 位于全部用户 Consumer Filter 之前，因此耗时
+覆盖服务发现、建连、网络往返和等待响应；Provider 指标 Filter 位于 deadline 检查
+之后、全部用户 Provider Filter 之前，因此只统计真正进入业务处理链的请求。
+
+| 指标名 | 含义 |
+|---|---|
+| `mini.rpc.consumer.requests` | Consumer 进入完整远程调用链的请求总数 |
+| `mini.rpc.consumer.requests.success` | Consumer 收到成功响应的数量 |
+| `mini.rpc.consumer.requests.failure` | Consumer 收到失败响应或调用链抛出异常的数量 |
+| `mini.rpc.consumer.duration` | Consumer 完整远程调用耗时 |
+| `mini.rpc.provider.requests` | 通过 deadline 检查并进入 Provider 业务链的请求总数 |
+| `mini.rpc.provider.requests.success` | Provider 产生成功响应的数量 |
+| `mini.rpc.provider.requests.failure` | Provider 产生失败响应或业务链抛出异常的数量 |
+| `mini.rpc.provider.duration` | Provider 用户 Filter 与服务方法的处理耗时 |
+
+默认 `SimpleMeterRegistry` 只把数据保存在当前 JVM 内存，应用重启后清空，也不会
+自动开放 `/actuator` 或 Prometheus 抓取端点。业务应用声明自己的 `MeterRegistry`
+Bean 时，默认注册表会让位，两个内置 Filter 自动复用该 Bean。R3-A 暂不记录接口、
+方法、group/version 标签，避免在第一步引入高基数标签和更复杂的聚合规则。
+
 ---
 
 ## 5. 模块之间真正共享什么
@@ -868,7 +898,7 @@ String result = helloService.sayHello("world");
 3. 构造 RpcRequest
    接口名 + group + version + 方法名 + 参数 + requestId
                       ↓
-4. ConsumerFilterChain 按 @Order 执行 Consumer Filter
+4. ConsumerMetricsFilter 开始计数和计时，再按 @Order 执行用户 Consumer Filter
                       ↓
 5. RpcClient 开始发送，DefaultServiceAddressResolver 选址
                       ↓
@@ -899,7 +929,7 @@ String result = helloService.sayHello("world");
 17. ProviderDeadlineFilter 检查 deadline
     已过期：直接返回失败，不执行服务方法
                       ↓ 未过期
-18. 按 @Order 执行用户 Provider Filter
+18. ProviderMetricsFilter 开始计数和计时，再按 @Order 执行用户 Provider Filter
                       ↓
 19. RpcRequestHandler 从 DefaultServiceProvider 查找 HelloServiceImpl 对象
                       ↓
@@ -920,7 +950,7 @@ String result = helloService.sayHello("world");
                       ↓
 27. NettyRpcClientHandler 根据 requestId 完成对应 future
                       ↓
-28. 响应沿 ConsumerFilterChain 返回，执行 Filter 后置逻辑
+28. 响应沿 ConsumerFilterChain 返回，记录 Consumer 结果和完整调用耗时
                       ↓
 29. RpcClientProxy 取出 data，作为 sayHello 的返回值
 ```
@@ -1205,17 +1235,20 @@ mini-rpc-example-consumer
 6. 容器端到端测试需要本机或 CI 提供可用的 Docker 引擎；没有 Docker 时该用例
    会跳过，但不影响其余单元测试；
 7. Provider 已使用可配置的有界业务线程池隔离 Netty I/O 与服务方法，但目前只有
-   全局线程池，还没有按服务隔离和 Micrometer 持续指标；任意 Java 业务代码如果
+   全局线程池，还没有按服务隔离；任意 Java 业务代码如果
    永久阻塞且忽略线程中断，框架仍无法安全地强制终止；
 8. deadline 使用 Consumer 的绝对 Epoch 毫秒，要求 Consumer 与 Provider 系统时钟
    基本同步；执行中的请求支持通过 `RpcCallContext.checkDeadline()` 协作式结束，
    但框架尚不会自动中断未主动检查的业务方法，上下文也不会自动传播到异步线程；
 9. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
 10. Starter 已自动收集 Consumer/Provider Filter Spring Bean 并按 `@Order` 排序；
-    Provider 内置 deadline Filter 固定先于用户 Filter。当前 Filter 全局作用于本侧
-    所有 RPC 调用，还没有按服务、方法或配置条件选择性启用；直接使用旧 Socket
+    Provider 内置 deadline Filter 固定先于指标和用户 Filter。当前 Filter 全局作用于
+    本侧所有 RPC 调用，还没有按服务、方法或配置条件选择性启用；直接使用旧 Socket
     教学入口的调用不会经过 Netty Provider Filter 链；
-11. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
+11. Micrometer 当前只记录两侧聚合的请求数、成功/失败和耗时；默认
+    `SimpleMeterRegistry` 不持久化、不开放 Actuator/Prometheus 端点，也还没有接口、
+    方法标签、在途请求数、业务线程池活跃数、队列长度和拒绝次数 Gauge；
+12. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
 ---
 
@@ -1224,12 +1257,14 @@ mini-rpc-example-consumer
 Spring 基础链路和第一批运行可靠性能力已经完整跑通。接下来优先补齐
 已有调用模型中的语义、观测和扩展缺口：
 
-1. 基于现有 Filter 扩展点增加 Micrometer 核心指标，先覆盖请求数、成功/失败、
-   调用耗时和 Provider 业务线程池状态；
-2. 再实现 Serializer/LoadBalance 的最小 SPI；
-3. 默认不做透明业务重试，重试由业务根据幂等性显式决定；
-4. 补充 CI、性能基线和弱网/长稳测试；
-5. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
+1. 在当前 Micrometer 请求与耗时指标上，单独增加 Provider 在途请求、业务线程池
+   活跃线程、队列长度和拒绝次数 Gauge；
+2. 再单独接入 Spring Boot Actuator 与 Prometheus Registry，不在核心指标阶段部署
+   Prometheus 或 Grafana；
+3. 再实现 Serializer/LoadBalance 的最小 SPI；
+4. 默认不做透明业务重试，重试由业务根据幂等性显式决定；
+5. 补充 CI、性能基线和弱网/长稳测试；
+6. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有
    执行前检查与协作式检查，因此暂缓到确有需求时再实现，避免过度设计。
 
 更细的 Spring 分步计划参见

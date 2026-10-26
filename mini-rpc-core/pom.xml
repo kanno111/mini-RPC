@@ -36,6 +36,16 @@
         </dependency>
 
         <!--
+            R3-A 使用 Micrometer 的统一指标 API 记录 RPC 请求数量和耗时。
+            core 只依赖 micrometer-core，不依赖 Actuator、Prometheus 或具体监控后端；
+            版本继续由父工程导入的 Spring Boot BOM 统一管理。
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
+
+        <!--
             M2 使用 Netty 实现新的客户端和服务端传输层。
             这里只声明“core 模块需要 Netty”，具体版本由父工程统一管理。
         -->

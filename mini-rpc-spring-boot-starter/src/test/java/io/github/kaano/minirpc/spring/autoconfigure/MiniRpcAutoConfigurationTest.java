@@ -7,6 +7,8 @@ import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
+import io.github.kaano.minirpc.metrics.ConsumerMetricsFilter;
+import io.github.kaano.minirpc.metrics.ProviderMetricsFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilterChain;
 import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
@@ -16,6 +18,8 @@ import io.github.kaano.minirpc.serialize.JdkSerializer;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
 import io.github.kaano.minirpc.serialize.Serializer;
 import io.github.kaano.minirpc.transport.client.NettyRpcClient;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -167,6 +171,36 @@ class MiniRpcAutoConfigurationTest {
     }
 
     @Test
+    void shouldCreateInMemoryMetricsRegistryAndBuiltInFilters() {
+        contextRunner.run(context -> {
+            assertThat(context).hasSingleBean(MeterRegistry.class);
+            assertThat(context.getBean(MeterRegistry.class))
+                    .isInstanceOf(SimpleMeterRegistry.class);
+            assertThat(context).hasSingleBean(ConsumerMetricsFilter.class);
+            assertThat(context).hasSingleBean(ProviderMetricsFilter.class);
+        });
+    }
+
+    @Test
+    void shouldUseApplicationProvidedMeterRegistry() {
+        SimpleMeterRegistry customRegistry = new SimpleMeterRegistry();
+
+        contextRunner
+                .withBean(MeterRegistry.class, () -> customRegistry)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(MeterRegistry.class);
+                    assertThat(context.getBean(MeterRegistry.class))
+                            .isSameAs(customRegistry);
+                    assertThat(context).hasSingleBean(
+                            ConsumerMetricsFilter.class
+                    );
+                    assertThat(context).hasSingleBean(
+                            ProviderMetricsFilter.class
+                    );
+                });
+    }
+
+    @Test
     void shouldCollectConsumerAndProviderFiltersBySpringOrder() {
         contextRunner
                 // 故意按“晚、早”的顺序注册，证明结果由 @Order 而非注册顺序决定。
@@ -182,6 +216,7 @@ class MiniRpcAutoConfigurationTest {
                     assertThat(consumerFilters)
                             .extracting(Object::getClass)
                             .containsExactly(
+                                    ConsumerMetricsFilter.class,
                                     EarlyConsumerFilter.class,
                                     LateConsumerFilter.class
                             );
@@ -193,6 +228,7 @@ class MiniRpcAutoConfigurationTest {
                     assertThat(providerFilters)
                             .extracting(Object::getClass)
                             .containsExactly(
+                                    ProviderMetricsFilter.class,
                                     EarlyProviderFilter.class,
                                     LateProviderFilter.class
                             );
