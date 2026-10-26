@@ -4,12 +4,18 @@ import io.github.kaano.minirpc.common.RpcException;
 import io.github.kaano.minirpc.common.RpcRequest;
 import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.provider.RpcRequestHandler;
+import io.github.kaano.minirpc.provider.filter.DefaultProviderFilterChain;
+import io.github.kaano.minirpc.provider.filter.ProviderDeadlineFilter;
+import io.github.kaano.minirpc.provider.filter.ProviderFilterChain;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 
@@ -17,7 +23,7 @@ import java.util.concurrent.RejectedExecutionException;
  * Netty 服务端的 RPC 业务处理器。
  *
  * <p>前面的解码器已经把网络字节还原成 {@link RpcRequest}，本类不再处理字节，
- * 只负责把请求交给 {@link RpcRequestHandler} 执行，并把得到的
+ * 只负责把请求交给 Provider Filter 调用链执行，并把得到的
  * {@link RpcResponse} 写回客户端。</p>
  *
  * <pre>
@@ -27,7 +33,7 @@ import java.util.concurrent.RejectedExecutionException;
  *    ↓
  * NettyRpcServerHandler：把请求提交给 Provider 业务线程池
  *    ↓
- * Provider 业务线程：执行请求，得到 RpcResponse
+ * Provider 业务线程：deadline Filter → RpcRequestHandler，得到 RpcResponse
  *    ↓
  * RpcEncoder：RpcResponse 变成网络字节
  * </pre>
@@ -41,8 +47,8 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
     private static final Logger LOGGER =
             LoggerFactory.getLogger(NettyRpcServerHandler.class);
 
-    /** 负责真正的服务查找、反射调用和响应封装。 */
-    private final RpcRequestHandler requestHandler;
+    /** 业务线程执行的根调用链：deadline Filter → 服务查找与方法调用。 */
+    private final ProviderFilterChain requestChain;
 
     /** 统计已进入业务执行、但响应写入尚未完成的请求。 */
     private final InFlightRequestTracker requestTracker;
@@ -59,18 +65,51 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
             InFlightRequestTracker requestTracker,
             Executor businessExecutor
     ) {
+        this(requestHandler, requestTracker, businessExecutor, List.of());
+    }
+
+    /**
+     * 使用用户 Filter 创建 Handler。内置 deadline Filter 固定排在首位，保证
+     * 过期请求不会先进入日志、鉴权等用户扩展，更不会到达业务方法。
+     */
+    NettyRpcServerHandler(
+            RpcRequestHandler requestHandler,
+            InFlightRequestTracker requestTracker,
+            Executor businessExecutor,
+            List<ProviderFilter> userFilters
+    ) {
         if (requestHandler == null) {
             throw new RpcException("RpcRequestHandler 不能为空");
         }
+        this.requestChain = new DefaultProviderFilterChain(
+                createProviderFilters(userFilters),
+                requestHandler
+        );
         if (requestTracker == null) {
             throw new RpcException("InFlightRequestTracker 不能为空");
         }
         if (businessExecutor == null) {
             throw new RpcException("Provider 业务执行器不能为空");
         }
-        this.requestHandler = requestHandler;
         this.requestTracker = requestTracker;
         this.businessExecutor = businessExecutor;
+    }
+
+    /** 校验用户列表并在其前面安装不可移除的内置 deadline Filter。 */
+    private static List<ProviderFilter> createProviderFilters(
+            List<ProviderFilter> userFilters
+    ) {
+        if (userFilters == null) {
+            throw new RpcException("Provider Filter 列表不能为空");
+        }
+        if (userFilters.stream().anyMatch(filter -> filter == null)) {
+            throw new RpcException("Provider Filter 列表不能包含 null");
+        }
+
+        List<ProviderFilter> filters = new ArrayList<>(userFilters.size() + 1);
+        filters.add(new ProviderDeadlineFilter());
+        filters.addAll(userFilters);
+        return List.copyOf(filters);
     }
 
     /**
@@ -100,7 +139,7 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
         /*
          * channelRead0 运行在 Netty worker EventLoop。这里只提交任务便立即返回，
          * 让 EventLoop 能继续处理同一线程管理的其他 Channel，不能在这里直接
-         * 调用 requestHandler.handle(request)。
+         * 调用 requestChain.proceed(request)。
          */
         try {
             businessExecutor.execute(
@@ -149,18 +188,18 @@ public class NettyRpcServerHandler extends SimpleChannelInboundHandler<RpcReques
         LOGGER.warn("Provider 业务任务被拒绝，requestId：{}", requestId);
     }
 
-    /** 在 Provider 业务线程中查找服务、反射调用并安排响应写回。 */
+    /** 在 Provider 业务线程中执行 Filter 和服务方法，再安排响应写回。 */
     private void executeAndRespond(
             ChannelHandlerContext context,
             RpcRequest request
     ) {
         RpcResponse response;
         try {
-            response = requestHandler.handle(request);
+            response = requestChain.proceed(request);
         } catch (RuntimeException exception) {
             /*
              * 该方法现在运行在普通业务线程中，异常不能再依赖 Netty Pipeline
-             * 自动捕获。因此把请求执行器自身的意外异常也转换成失败响应，确保
+             * 自动捕获。因此把 Filter 或请求执行器的意外异常也转换成失败响应，确保
              * Consumer 得到结果，并让在途计数最终能够归零。
              */
             response = RpcResponse.failure(request.getRequestId(), exception);

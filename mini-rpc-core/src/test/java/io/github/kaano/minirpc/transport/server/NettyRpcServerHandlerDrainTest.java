@@ -3,10 +3,13 @@ package io.github.kaano.minirpc.transport.server;
 import io.github.kaano.minirpc.common.RpcRequest;
 import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.provider.RpcRequestHandler;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.RejectedExecutionException;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -144,6 +147,53 @@ class NettyRpcServerHandlerDrainTest {
             assertEquals(expectedResponse, channel.readOutbound());
             assertEquals(0, tracker.getInFlightRequestCount());
             verify(requestHandler).handle(request);
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldRejectExpiredRequestInBusinessTaskBeforeInvokingService() {
+        RpcRequest request = RpcRequest.builder()
+                .requestId(505L)
+                .deadlineEpochMillis(System.currentTimeMillis() - 1)
+                .build();
+        RpcRequestHandler requestHandler = mock(RpcRequestHandler.class);
+        InFlightRequestTracker tracker = new InFlightRequestTracker();
+        AtomicReference<Runnable> submittedTask = new AtomicReference<>();
+        AtomicInteger userFilterCalls = new AtomicInteger();
+        ProviderFilter userFilter = (currentRequest, chain) -> {
+            userFilterCalls.incrementAndGet();
+            return chain.proceed(currentRequest);
+        };
+        EmbeddedChannel channel = new EmbeddedChannel(
+                new NettyRpcServerHandler(
+                        requestHandler,
+                        tracker,
+                        submittedTask::set,
+                        List.of(userFilter)
+                )
+        );
+
+        try {
+            channel.writeInbound(request);
+
+            assertNotNull(submittedTask.get());
+            assertNull(channel.readOutbound(),
+                    "进入业务线程前，EventLoop 不应提前执行 deadline Filter");
+            assertEquals(1, tracker.getInFlightRequestCount());
+            verifyNoInteractions(requestHandler);
+
+            submittedTask.get().run();
+            channel.runPendingTasks();
+
+            RpcResponse response = channel.readOutbound();
+            assertEquals(505L, response.getRequestId());
+            assertEquals(RpcResponse.FAILURE_CODE, response.getCode());
+            assertEquals(0, tracker.getInFlightRequestCount());
+            assertEquals(0, userFilterCalls.get(),
+                    "内置 deadline Filter 必须在用户 Filter 前短路");
+            verifyNoInteractions(requestHandler);
         } finally {
             channel.finishAndReleaseAll();
         }

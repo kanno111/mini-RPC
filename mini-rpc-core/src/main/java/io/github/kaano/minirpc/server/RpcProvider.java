@@ -6,6 +6,7 @@ import io.github.kaano.minirpc.common.ServiceKey;
 import io.github.kaano.minirpc.provider.DefaultServiceProvider;
 import io.github.kaano.minirpc.provider.RpcRequestHandler;
 import io.github.kaano.minirpc.provider.ServiceProvider;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.registry.ServiceAddress;
 import io.github.kaano.minirpc.registry.ServiceRegistry;
 import io.github.kaano.minirpc.registry.zookeeper.ZooKeeperClientFactory;
@@ -185,15 +186,14 @@ public final class RpcProvider implements AutoCloseable {
                 shutdownTimeout,
                 NettyRpcServer.DEFAULT_CLIENT_IDLE_TIMEOUT,
                 businessThreadCount,
-                businessQueueCapacity
+                businessQueueCapacity,
+                List.of()
         );
     }
 
     /**
-     * 使用完整的 Provider 网络、关闭、静默连接和业务线程池配置创建实例。
-     *
-     * <p>Spring Boot Starter 使用这个构造方法。旧构造方法继续委托到这里并使用
-     * 默认客户端读空闲时间，保持非 Spring 教学入口兼容。</p>
+     * 使用完整 Provider 配置和按顺序排列的用户 Filter 创建实例。
+     * 内置 deadline Filter 由 Netty 服务端统一放在用户 Filter 之前。
      */
     public RpcProvider(
             String host,
@@ -203,7 +203,8 @@ public final class RpcProvider implements AutoCloseable {
             Duration shutdownTimeout,
             Duration clientIdleTimeout,
             int businessThreadCount,
-            int businessQueueCapacity
+            int businessQueueCapacity,
+            List<ProviderFilter> providerFilters
     ) {
         this.serviceAddress = new ServiceAddress(host, port);
         this.serviceProvider = new DefaultServiceProvider();
@@ -217,10 +218,39 @@ public final class RpcProvider implements AutoCloseable {
                 shutdownTimeout,
                 clientIdleTimeout,
                 businessThreadCount,
-                businessQueueCapacity
+                businessQueueCapacity,
+                providerFilters
         );
         this.serviceRegistry =
                 new ZooKeeperServiceRegistry(zooKeeperAddress);
+    }
+
+    /**
+     * 使用完整的 Provider 网络、关闭、静默连接和业务线程池配置创建实例。
+     *
+     * <p>旧构造方法继续使用空的用户 Filter 列表，保持非 Spring 教学入口兼容。</p>
+     */
+    public RpcProvider(
+            String host,
+            int port,
+            String zooKeeperAddress,
+            Serializer serializer,
+            Duration shutdownTimeout,
+            Duration clientIdleTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
+    ) {
+        this(
+                host,
+                port,
+                zooKeeperAddress,
+                serializer,
+                shutdownTimeout,
+                clientIdleTimeout,
+                businessThreadCount,
+                businessQueueCapacity,
+                List.of()
+        );
     }
 
     /**

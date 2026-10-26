@@ -2,6 +2,7 @@ package io.github.kaano.minirpc.transport.server;
 
 import io.github.kaano.minirpc.common.RpcException;
 import io.github.kaano.minirpc.provider.RpcRequestHandler;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.serialize.Serializer;
 import io.github.kaano.minirpc.transport.codec.RpcDecoder;
 import io.github.kaano.minirpc.transport.codec.RpcEncoder;
@@ -19,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -176,15 +178,12 @@ public class NettyRpcServer implements RpcServer {
                 shutdownTimeout,
                 DEFAULT_CLIENT_IDLE_TIMEOUT,
                 businessThreadCount,
-                businessQueueCapacity
+                businessQueueCapacity,
+                List.of()
         );
     }
 
-    /**
-     * 创建包含关闭排空、客户端读空闲和业务线程池参数的 Netty 服务端。
-     *
-     * @param clientIdleTimeout 单条客户端连接连续多久没有入站数据后关闭
-     */
+    /** 使用完整运行参数和用户 Provider Filter 创建 Netty 服务端。 */
     public NettyRpcServer(
             int port,
             Serializer serializer,
@@ -192,7 +191,8 @@ public class NettyRpcServer implements RpcServer {
             Duration shutdownTimeout,
             Duration clientIdleTimeout,
             int businessThreadCount,
-            int businessQueueCapacity
+            int businessQueueCapacity,
+            List<ProviderFilter> providerFilters
     ) {
         if (port < 1 || port > 65535) {
             throw new RpcException("RPC 服务端端口必须在 1 到 65535 之间：" + port);
@@ -219,7 +219,34 @@ public class NettyRpcServer implements RpcServer {
         this.serverHandler = new NettyRpcServerHandler(
                 requestHandler,
                 requestTracker,
-                businessExecutor
+                businessExecutor,
+                providerFilters
+        );
+    }
+
+    /**
+     * 创建包含关闭排空、客户端读空闲和业务线程池参数的 Netty 服务端。
+     *
+     * @param clientIdleTimeout 单条客户端连接连续多久没有入站数据后关闭
+     */
+    public NettyRpcServer(
+            int port,
+            Serializer serializer,
+            RpcRequestHandler requestHandler,
+            Duration shutdownTimeout,
+            Duration clientIdleTimeout,
+            int businessThreadCount,
+            int businessQueueCapacity
+    ) {
+        this(
+                port,
+                serializer,
+                requestHandler,
+                shutdownTimeout,
+                clientIdleTimeout,
+                businessThreadCount,
+                businessQueueCapacity,
+                List.of()
         );
     }
 

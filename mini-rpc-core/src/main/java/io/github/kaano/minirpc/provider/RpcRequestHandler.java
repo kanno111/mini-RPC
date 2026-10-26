@@ -13,7 +13,9 @@ import java.lang.reflect.Method;
  *
  * <p>网络层把字节反序列化成 {@link RpcRequest} 后，会把请求交给这个类。
  * 它负责找到本地服务对象、通过反射执行目标方法，并把结果包装成
- * {@link RpcResponse}。这个类不负责 Socket 读写。</p>
+ * {@link RpcResponse}。Netty 入口会先经过 ProviderDeadlineFilter，再进入本类；
+ * 本类仍在服务方法执行期间绑定 {@link RpcCallContext}，供业务代码协作检查
+ * deadline。这个类不负责 Socket 读写。</p>
  */
 public class RpcRequestHandler {
 
@@ -49,25 +51,6 @@ public class RpcRequestHandler {
         }
 
         long requestId = request.getRequestId();
-
-        long deadlineEpochMillis = request.getDeadlineEpochMillis();
-        long currentEpochMillis = System.currentTimeMillis();
-        if (deadlineEpochMillis > 0
-                && currentEpochMillis >= deadlineEpochMillis) {
-            /*
-             * Consumer 已经没有必要继续等待这次调用。这里必须放在服务查找和反射
-             * 执行之前，确保过期请求不会产生数据库写入等业务副作用。
-             */
-            return RpcResponse.failure(
-                    requestId,
-                    new RpcException(
-                            "RPC 请求在 Provider 执行前已超过 deadline，requestId："
-                                    + requestId
-                                    + "，deadline：" + deadlineEpochMillis
-                                    + "，当前时间：" + currentEpochMillis
-                    )
-            );
-        }
 
         try {
             /*
@@ -111,7 +94,7 @@ public class RpcRequestHandler {
             Object result;
             try (RpcCallContext.Scope ignored = RpcCallContext.bind(
                     requestId,
-                    deadlineEpochMillis
+                    request.getDeadlineEpochMillis()
             )) {
                 result = method.invoke(service, parameters);
             }

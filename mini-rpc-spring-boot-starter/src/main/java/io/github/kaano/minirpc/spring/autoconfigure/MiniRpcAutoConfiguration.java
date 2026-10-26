@@ -4,6 +4,8 @@ import io.github.kaano.minirpc.client.RpcClientFactory;
 import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
 import io.github.kaano.minirpc.serialize.JdkSerializer;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
 import io.github.kaano.minirpc.serialize.Serializer;
@@ -19,6 +21,8 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Lazy;
 
+import java.util.List;
+
 /**
  * mini-RPC 的 Spring Boot 自动配置入口。
  *
@@ -26,7 +30,7 @@ import org.springframework.context.annotation.Lazy;
  * {@code AutoConfiguration.imports} 找到本类，不需要业务方手动写
  * {@code @Import(MiniRpcAutoConfiguration.class)}。</p>
  *
- * <p>本类目前完成五项装配：</p>
+ * <p>本类目前完成六项装配：</p>
  *
  * <ol>
  *     <li>让 {@link MiniRpcProperties} 成为 Spring 管理的配置 Bean；</li>
@@ -34,6 +38,7 @@ import org.springframework.context.annotation.Lazy;
  *     <li>注册处理 {@code @RpcReference} 的 Bean 后置处理器；</li>
  *     <li>把 {@code @RpcService} 类注册成真正的 Spring Bean；</li>
  *     <li>让 {@link RpcProvider} 随 Spring 容器自动启动和关闭。</li>
+ *     <li>收集 Consumer/Provider Filter Bean，并按 Spring 顺序规则交给 core。</li>
  * </ol>
  *
  * <p>“延迟创建”表示仅仅启动 Spring 容器时不会连接 ZooKeeper。等后续真的有
@@ -138,6 +143,9 @@ public class MiniRpcAutoConfiguration {
      * </ul>
      *
      * @param properties 已经绑定好 application.yml 的 mini-RPC 配置
+     * @param serializer Consumer 使用的正文序列化器
+     * @param loadBalance Consumer 使用的负载均衡策略
+     * @param consumerFilterProvider 延迟取得全部 Consumer Filter 的 Spring 入口
      * @return 由 Spring 持有的 RPC 客户端工厂
      */
     @Bean(destroyMethod = "close")
@@ -146,19 +154,29 @@ public class MiniRpcAutoConfiguration {
     public RpcClientFactory rpcClientFactory(
             MiniRpcProperties properties,
             Serializer serializer,
-            LoadBalance loadBalance
+            LoadBalance loadBalance,
+            ObjectProvider<ConsumerFilter> consumerFilterProvider
     ) {
+        List<ConsumerFilter> consumerFilters = collectOrderedFilters(
+                consumerFilterProvider
+        );
         return new RpcClientFactory(
                 properties.getRegistryAddress(),
                 properties.getRequestTimeout(),
                 properties.getHeartbeatInterval(),
                 properties.getHeartbeatTimeout(),
                 serializer,
-                loadBalance
+                loadBalance,
+                consumerFilters
         );
     }
 
-    /** 创建 Spring Provider 使用的高层 RPC 服务端。 */
+    /**
+     * 创建 Spring Provider 使用的高层 RPC 服务端。
+     *
+     * <p>用户 Filter 在这里完成一次排序和快照；core 不依赖 Spring，只接收普通
+     * List。内置 deadline Filter 由服务端放在用户 Filter 之前。</p>
+     */
     @Bean(destroyMethod = "close")
     @ConditionalOnProperty(
             prefix = "mini-rpc",
@@ -168,8 +186,12 @@ public class MiniRpcAutoConfiguration {
     @ConditionalOnMissingBean(RpcProvider.class)
     public RpcProvider rpcProvider(
             MiniRpcProperties properties,
-            Serializer serializer
+            Serializer serializer,
+            ObjectProvider<ProviderFilter> providerFilterProvider
     ) {
+        List<ProviderFilter> providerFilters = collectOrderedFilters(
+                providerFilterProvider
+        );
         return new RpcProvider(
                 properties.getServerHost(),
                 properties.getServerPort(),
@@ -178,7 +200,8 @@ public class MiniRpcAutoConfiguration {
                 properties.getShutdownTimeout(),
                 properties.getProviderClientIdleTimeout(),
                 properties.getProviderBusinessThreads(),
-                properties.getProviderBusinessQueueCapacity()
+                properties.getProviderBusinessQueueCapacity(),
+                providerFilters
         );
     }
 
@@ -195,5 +218,15 @@ public class MiniRpcAutoConfiguration {
             ListableBeanFactory beanFactory
     ) {
         return new SpringRpcProviderLifecycle(rpcProvider, beanFactory);
+    }
+
+    /**
+     * 从 Spring 容器取得某一类 Filter，并遵循 Ordered 或 @Order 声明的顺序。
+     *
+     * <p>返回不可修改的列表快照，随后传给 core。方法保持包可见，测试可以在不
+     * 创建 ZooKeeper/Netty 资源的情况下验证自动收集与排序规则。</p>
+     */
+    static <T> List<T> collectOrderedFilters(ObjectProvider<T> provider) {
+        return provider.orderedStream().toList();
     }
 }

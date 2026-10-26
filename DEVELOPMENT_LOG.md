@@ -1657,3 +1657,6 @@ Netty EventLoop 编码并写入 Socket
 从 S5-H-C-B（3.30）开始，新的阶段记录续写到根目录
 [`DEVELOPMENT_LOG2.md`](DEVELOPMENT_LOG2.md)。本文件保留 3.1～3.29 的历史记录，
 不再继续增长；README 仍会随架构、配置和使用方式变化同步更新。
+
+R2-B、R2-C 和 R2-D 的目标、修改、行为变化、设计原因、验证与限制详见
+[`DEVELOPMENT_LOG2.md`](DEVELOPMENT_LOG2.md) 的 3.44～3.46 节。

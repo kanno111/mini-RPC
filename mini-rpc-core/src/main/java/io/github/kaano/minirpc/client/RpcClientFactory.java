@@ -6,6 +6,7 @@ import io.github.kaano.minirpc.common.ServiceKey;
 import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
 import io.github.kaano.minirpc.proxy.RpcClientProxy;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
 import io.github.kaano.minirpc.registry.zookeeper.ZooKeeperClientFactory;
 import io.github.kaano.minirpc.registry.zookeeper.ZooKeeperServiceDiscovery;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
@@ -13,6 +14,7 @@ import io.github.kaano.minirpc.serialize.Serializer;
 import io.github.kaano.minirpc.transport.client.NettyRpcClient;
 
 import java.time.Duration;
+import java.util.List;
 
 /**
  * 面向 RPC 使用者的高层客户端工厂。
@@ -55,6 +57,9 @@ public final class RpcClientFactory implements AutoCloseable {
 
     /** 负责把 Java 接口转换成 JDK 动态代理对象。 */
     private final RpcClientProxy proxyFactory;
+
+    /** 当前工厂创建的所有代理共享的有序 Consumer Filter 快照。 */
+    private final List<ConsumerFilter> consumerFilters;
 
     /** 防止关闭后继续创建代理，也让重复关闭保持安全。 */
     private volatile boolean closed;
@@ -161,6 +166,34 @@ public final class RpcClientFactory implements AutoCloseable {
             Serializer serializer,
             LoadBalance loadBalance
     ) {
+        this(
+                zooKeeperAddress,
+                requestTimeout,
+                heartbeatInterval,
+                heartbeatTimeout,
+                serializer,
+                loadBalance,
+                List.of()
+        );
+    }
+
+    /**
+     * 使用完整配置和固定顺序的 Consumer Filter 组装客户端调用链。
+     *
+     * <p>Spring Starter 会把容器中的 Filter Bean 按顺序收集后传到这里；core
+     * 只接收普通 List，不依赖任何 Spring 类型。列表在构造时复制，应用运行期间
+     * 新增或删除 Bean 不会改变已经创建的代理链。</p>
+     */
+    public RpcClientFactory(
+            String zooKeeperAddress,
+            Duration requestTimeout,
+            Duration heartbeatInterval,
+            Duration heartbeatTimeout,
+            Serializer serializer,
+            LoadBalance loadBalance,
+            List<ConsumerFilter> consumerFilters
+    ) {
+        this.consumerFilters = copyConsumerFilters(consumerFilters);
         this.serviceDiscovery =
                 new ZooKeeperServiceDiscovery(zooKeeperAddress);
 
@@ -178,7 +211,13 @@ public final class RpcClientFactory implements AutoCloseable {
                     heartbeatInterval,
                     heartbeatTimeout
             );
-            this.proxyFactory = new RpcClientProxy(rpcClient);
+            this.proxyFactory = new RpcClientProxy(
+                    rpcClient,
+                    ServiceKey.DEFAULT_GROUP,
+                    ServiceKey.DEFAULT_VERSION,
+                    null,
+                    this.consumerFilters
+            );
         } catch (RuntimeException exception) {
             /*
              * ZooKeeper 已经连接成功，但后面的组件创建失败时，也必须关闭
@@ -258,8 +297,22 @@ public final class RpcClientFactory implements AutoCloseable {
                 rpcClient,
                 group,
                 version,
-                requestTimeout
+                requestTimeout,
+                consumerFilters
         ).createProxy(serviceInterface);
+    }
+
+    /** 校验并冻结 Starter 或手动入口传入的 Consumer Filter 顺序。 */
+    private static List<ConsumerFilter> copyConsumerFilters(
+            List<ConsumerFilter> filters
+    ) {
+        if (filters == null) {
+            throw new RpcException("Consumer Filter 列表不能为空");
+        }
+        if (filters.stream().anyMatch(filter -> filter == null)) {
+            throw new RpcException("Consumer Filter 列表不能包含 null");
+        }
+        return List.copyOf(filters);
     }
 
     /**

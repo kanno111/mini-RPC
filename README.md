@@ -358,8 +358,8 @@ io.github.kaano.minirpc
 ├── cluster        服务发现和负载均衡的组合层
 ├── common         RPC 公共数据模型和协议常量
 ├── loadbalance    负载均衡抽象与实现
-├── provider       服务端本地服务表和反射调用
-├── proxy          客户端动态代理
+├── provider       服务端本地服务表、Provider Filter 和反射调用
+├── proxy          客户端动态代理和 Consumer Filter
 ├── registry       注册中心抽象、地址模型和 ZooKeeper 实现
 ├── serialize      序列化抽象与实现
 ├── server         服务端高层入口和注解扫描
@@ -423,6 +423,40 @@ Provider 收到请求后，会把 `interfaceName + group + version` 组成不可
 时，会兼容到 `default/1.0`。同一个 ServiceKey 同时用于注册中心路径、地址缓存、
 Watch 失效和轮询状态，避免发现阶段与 Provider 执行阶段选择不同服务身份。
 
+R2-D 已把 Consumer Filter 链放在动态代理与 `RpcClient` 之间，并由 Starter 自动
+收集 Spring Bean：
+
+```text
+helloService.sayHello(...)
+    → RpcClientProxy 构造 RpcRequest
+    → ConsumerFilterChain（按 Spring @Order 排序）
+    → RpcClient.sendRequest(...) → 网络
+```
+
+Filter 可围绕网络调用执行前置/后置逻辑，也可返回失败响应，阻止真正发送。
+业务项目只需把 `ConsumerFilter` 实现声明为 Spring Bean；Starter 会通过
+`ObjectProvider.orderedStream()` 收集全部实现，并把不可变顺序快照交给 core。
+数值更小的 `@Order` 会更早执行前置逻辑、更晚执行后置逻辑。没有声明 Filter Bean
+时使用空链，单引用 timeout 仍传给 `RpcClient` 的带 `Duration` 重载。
+
+```java
+@Component
+@Order(10)
+public class ConsumerTimingFilter implements ConsumerFilter {
+
+    @Override
+    public RpcResponse filter(RpcRequest request, ConsumerFilterChain chain) {
+        long startNanos = System.nanoTime();
+        try {
+            return chain.proceed(request);
+        } finally {
+            long elapsedNanos = System.nanoTime() - startNanos;
+            // 示例：在这里记录本次完整远程调用耗时。
+        }
+    }
+}
+```
+
 ### 4.3 serialize：序列化
 
 | 类 | 作用 |
@@ -445,6 +479,10 @@ Java 对象 ⇄ byte[]
 |---|---|
 | `ServiceProvider` | 本地服务表抽象 |
 | `DefaultServiceProvider` | 使用 ConcurrentHashMap 保存 ServiceKey 到实现对象的映射 |
+| `ProviderFilter` | Provider 横切逻辑的单个责任链节点 |
+| `ProviderFilterChain` | 继续执行下一个 Filter 或最终服务调用的统一入口 |
+| `DefaultProviderFilterChain` | 按固定顺序执行 Filter，最后进入 RpcRequestHandler |
+| `ProviderDeadlineFilter` | 在服务方法执行前拒绝已过期请求 |
 | `RpcRequestHandler` | 根据请求查找实现对象并通过反射执行方法 |
 
 本地服务表保存：
@@ -457,6 +495,43 @@ ServiceKey(HelloService, gray,    2.0) → HelloServiceGrayV2Impl
 
 这里的 `ServiceProvider` 不要和“远程 Provider 地址”混淆。它只存在于服务端
 当前 JVM 的内存中，不会把 Java 对象放入 ZooKeeper。
+
+R2-A 已经建立 Provider Filter 的最小责任链骨架：
+
+```text
+ProviderFilter A 前置
+        ↓
+ProviderFilter B 前置
+        ↓
+RpcRequestHandler.handle(request)
+        ↓
+ProviderFilter B 后置
+        ↓
+ProviderFilter A 后置
+```
+
+Filter 可以调用 `chain.proceed(request)` 继续执行，也可以直接返回响应实现短路。
+默认链使用不可变过滤器快照和不可变执行位置，因此同一个根链可以安全地由多个
+Provider 业务线程并发复用；但链中共享的 Filter 实例仍然必须由实现者保证线程安全，
+不能把单次请求数据放进普通成员变量。
+
+R2-D 中 Starter 也会自动收集 `ProviderFilter` Spring Bean。Provider 的执行顺序为：
+
+```text
+NettyRpcServerHandler → ProviderBusinessExecutor
+    → ProviderDeadlineFilter
+    → 用户 ProviderFilter（按 Spring @Order 排序）
+    → RpcRequestHandler → @RpcService 方法
+```
+
+deadline 检查发生在业务线程真正执行任务时，因此排队期间过期的请求也会在服务
+方法运行前被拒绝，而且不会进入用户 Filter。`RpcRequestHandler` 继续绑定
+`RpcCallContext`，供执行中的业务代码协作检查 deadline。旧 Socket 教学入口仍
+直接使用 `RpcRequestHandler`，默认请求不携带 deadline，也不经过 Provider Filter。
+
+两侧 Filter Bean 都会被多个并发请求共享，因此实现类必须是线程安全的；单次调用
+数据应保存在方法局部变量中，不能写进普通成员变量。Filter 对 `proceed` 应保持一次
+调用语义，否则可能重复执行服务方法或重复发送非幂等请求。
 
 ### 4.5 registry：注册中心
 
@@ -793,55 +868,61 @@ String result = helloService.sayHello("world");
 3. 构造 RpcRequest
    接口名 + group + version + 方法名 + 参数 + requestId
                       ↓
-4. DefaultServiceAddressResolver 开始选址
+4. ConsumerFilterChain 按 @Order 执行 Consumer Filter
                       ↓
-5. ZooKeeperServiceDiscovery 只查询匹配 ServiceKey 的 Provider 地址
+5. RpcClient 开始发送，DefaultServiceAddressResolver 选址
                       ↓
-6. 配置的 LoadBalance 策略选择一个地址
+6. ZooKeeperServiceDiscovery 只查询匹配 ServiceKey 的 Provider 地址
                       ↓
-7. NettyRpcClient 建立或复用目标 Channel
+7. 配置的 LoadBalance 策略选择一个地址
                       ↓
-8. 根据本次有效超时计算 deadlineEpochMillis
+8. NettyRpcClient 建立或复用目标 Channel
                       ↓
-9. PendingRequestManager 保存
+9. 根据本次有效超时计算 deadlineEpochMillis
+                      ↓
+10. PendingRequestManager 保存
    requestId → CompletableFuture<RpcResponse>
                       ↓
-10. RpcEncoder 编码为“20 字节协议头 + 配置的序列化正文”
+11. RpcEncoder 编码为“20 字节协议头 + 配置的序列化正文”
                       ↓
-11. 网络发送到 Provider
+12. 网络发送到 Provider
                       ↓
-12. 服务端 RpcDecoder 解码成 RpcRequest
+13. 服务端 RpcDecoder 解码成 RpcRequest
                       ↓
-13. NettyRpcServerHandler 取得在途请求许可
+14. NettyRpcServerHandler 取得在途请求许可
                       ↓
-14. 把请求提交到 ProviderBusinessExecutor
+15. 把请求提交到 ProviderBusinessExecutor
     Netty worker EventLoop 立即返回继续处理网络事件
                       ↓
-15. Provider 业务线程调用 RpcRequestHandler
+16. Provider 业务线程进入 DefaultProviderFilterChain
                       ↓
-16. RpcRequestHandler 检查 deadline
+17. ProviderDeadlineFilter 检查 deadline
     已过期：直接返回失败，不执行服务方法
                       ↓ 未过期
-17. DefaultServiceProvider 根据接口名找到 HelloServiceImpl 对象
+18. 按 @Order 执行用户 Provider Filter
                       ↓
-18. RpcRequestHandler 根据方法名和参数类型找到 Method
+19. RpcRequestHandler 从 DefaultServiceProvider 查找 HelloServiceImpl 对象
                       ↓
-19. 在 Provider 业务线程绑定 RpcCallContext
+20. RpcRequestHandler 根据方法名和参数类型找到 Method
                       ↓
-20. Method.invoke 执行 HelloServiceImpl.sayHello("world")
+21. 在 Provider 业务线程绑定 RpcCallContext
+                      ↓
+22. Method.invoke 执行 HelloServiceImpl.sayHello("world")
     耗时业务可在安全点调用 checkDeadline()
                       ↓
-21. 清理 RpcCallContext
+23. 清理 RpcCallContext
                       ↓
-22. 返回值包装成带有相同 requestId 的 RpcResponse
+24. 返回值包装成带有相同 requestId 的 RpcResponse
                       ↓
-23. RpcEncoder 编码响应并通过网络返回
+25. RpcEncoder 编码响应并通过网络返回
                       ↓
-24. 客户端 RpcDecoder 得到 RpcResponse
+26. 客户端 RpcDecoder 得到 RpcResponse
                       ↓
-25. NettyRpcClientHandler 根据 requestId 完成对应 future
+27. NettyRpcClientHandler 根据 requestId 完成对应 future
                       ↓
-26. RpcClientProxy 取出 data，作为 sayHello 的返回值
+28. 响应沿 ConsumerFilterChain 返回，执行 Filter 后置逻辑
+                      ↓
+29. RpcClientProxy 取出 data，作为 sayHello 的返回值
 ```
 
 ### requestId 为什么重要
@@ -1130,7 +1211,11 @@ mini-rpc-example-consumer
    基本同步；执行中的请求支持通过 `RpcCallContext.checkDeadline()` 协作式结束，
    但框架尚不会自动中断未主动检查的业务方法，上下文也不会自动传播到异步线程；
 9. 旧的非 Spring `RpcServiceScanner` 仍要求服务实现提供公开无参构造方法；
-10. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
+10. Starter 已自动收集 Consumer/Provider Filter Spring Bean 并按 `@Order` 排序；
+    Provider 内置 deadline Filter 固定先于用户 Filter。当前 Filter 全局作用于本侧
+    所有 RPC 调用，还没有按服务、方法或配置条件选择性启用；直接使用旧 Socket
+    教学入口的调用不会经过 Netty Provider Filter 链；
+11. 当前是单注册中心、单协议的学习实现，距离生产级可观测性和容错能力仍有距离。
 
 ---
 
@@ -1139,9 +1224,9 @@ mini-rpc-example-consumer
 Spring 基础链路和第一批运行可靠性能力已经完整跑通。接下来优先补齐
 已有调用模型中的语义、观测和扩展缺口：
 
-1. 建立 Consumer/Provider Filter 调用链，为 Metrics、Tracing、鉴权和限流
-   提供统一扩展位置；
-2. 增加 Micrometer 核心指标，再实现 Serializer/LoadBalance 的最小 SPI；
+1. 基于现有 Filter 扩展点增加 Micrometer 核心指标，先覆盖请求数、成功/失败、
+   调用耗时和 Provider 业务线程池状态；
+2. 再实现 Serializer/LoadBalance 的最小 SPI；
 3. 默认不做透明业务重试，重试由业务根据幂等性显式决定；
 4. 补充 CI、性能基线和弱网/长稳测试；
 5. deadline 自动中断与“响应只完成一次”涉及业务完成和定时任务竞争，当前已有

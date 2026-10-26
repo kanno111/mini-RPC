@@ -1154,3 +1154,332 @@ V1 Consumer 不会看到 V2 Provider 地址，V2 Consumer 也不会看到 V1 地
 - 路径下暂时只保存地址，没有权重、区域、健康度等 Provider 元数据；
 - 下一步建议进入 Filter 调用链：先定义 Consumer/Provider 两侧统一拦截边界，为
   Metrics、Tracing、鉴权和限流提供扩展位置。
+
+### 3.43 R2-A：Provider Filter 最小责任链骨架
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+先在 core 中建立 Provider Filter 的最小抽象和可验证的顺序执行语义，为后续把
+deadline、日志、指标、鉴权和限流从 `RpcRequestHandler` 等核心类中拆出提供统一
+扩展位置。本步只实现 Provider 骨架，不接入真实 Netty 请求路径，不同时实现
+Consumer Filter、Spring Bean 自动收集或 SPI。
+
+#### 主要修改
+
+- 新增 `ProviderFilter`，定义单个 Provider 横切处理节点；
+- 新增 `ProviderFilterChain`，用 `proceed(request)` 表示继续执行剩余调用链；
+- 新增 `DefaultProviderFilterChain`，按列表顺序执行 Filter，全部完成后进入
+  `RpcRequestHandler.handle(request)`；
+- 构造时对 Filter 列表进行防御性复制和空值校验，避免外部运行时修改顺序；
+- 调用链不保存共享可变下标，每个下一节点只保存自己的不可变位置，使根链可以由
+  多个 Provider 业务线程并发复用；
+- 明确 Filter 实例会被并发共享，实现类仍须自行保证成员状态线程安全；
+- 对 Filter 返回 `null`、空请求、空终点和包含空元素的列表提供明确失败信息；
+- 新增 `DefaultProviderFilterChainTest`，覆盖嵌套前置/后置顺序以及短路行为。
+
+#### 行为变化与调用链
+
+core 现在可以独立组装并执行下面的 Provider 调用链：
+
+```text
+Filter A before
+    ↓
+Filter B before
+    ↓
+RpcRequestHandler → 真实服务方法
+    ↓
+Filter B after
+    ↓
+Filter A after
+```
+
+Filter 不调用 `chain.proceed(request)` 而直接返回响应时，后续 Filter 和真实服务方法
+都不会执行。当前生产运行行为尚未改变：`NettyRpcServerHandler` 仍然通过业务线程池
+直接调用 `RpcRequestHandler`，因此本步新增的链只有显式组装时才会生效。
+
+#### 设计原因
+
+- 横切逻辑需要围绕服务调用执行，但不应继续堆积在反射处理器或 Netty Handler 中；
+- Provider Filter 与 Netty Pipeline 职责不同：前者处理已经解码的 RPC 调用语义，
+  后者处理字节、Channel、空闲事件和网络收发；
+- 不可变链节点比共享递增下标更适合并发 Provider，同一条根链不会因为并发请求而
+  串改执行位置；
+- 链结构线程安全不等于任意 Filter 自动线程安全，因此扩展约定明确禁止用普通成员
+  变量保存单次请求状态；
+- 第一小步使用固定列表而不做 SPI，先把责任链语义、短路行为和线程安全边界验证
+  清楚，避免一次引入过多扩展机制；
+- 终点继续复用现有 `RpcRequestHandler`，不在骨架阶段改写已经验证的服务查找和反射
+  调用逻辑。
+
+#### 验证方式
+
+- 执行 `DefaultProviderFilterChainTest`；
+- 验证正常链严格产生
+  `first-before → second-before → service-invoke → second-after → first-after`；
+- 验证首个 Filter 直接返回失败响应时，后续 Filter 和真实服务方法都不执行；
+- 第一次测试因测试夹具中的嵌套服务接口为 `private`，跨包反射返回访问失败；将测试
+  接口改为 `public` 后重新执行，2 个测试全部通过。该问题未涉及生产代码行为。
+- 使用命令级 JVM 内存上限执行 `mvn test`，六个 Maven 模块全部构建成功；
+- core 运行 64 个测试，0 失败、0 错误，其中需要 Docker 的 2 个真实 ZooKeeper
+  端到端用例因当前环境没有可用 Docker 而跳过；Starter 13 个测试全部通过；
+- 两条不依赖 Docker 的真实 Netty 心跳集成测试均通过。
+
+#### 当前限制和下一步
+
+- 调用链尚未接入 `NettyRpcServerHandler` 的真实业务执行路径；
+- deadline 执行前检查仍在 `RpcRequestHandler` 中，尚未成为 Filter；
+- 暂无 Consumer Filter，也没有 Spring Bean 自动收集与顺序配置；
+- 当前 Filter 若主动多次调用 `proceed`，可能多次执行服务方法；这是责任链扩展者必须
+  遵守的约束，后续文档和内置实现都应保持一次调用语义；
+- 下一步建议实施 R2-B：把 Provider 根调用链接入业务线程执行路径，并将 deadline
+  检查迁移为第一个内置 `ProviderDeadlineFilter`，使用测试保证迁移前后行为一致。
+
+### 3.44 R2-B：Provider Filter 接入真实 Netty 业务路径
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+让 R2-A 建立的责任链真正参与 Netty Provider 的每一次普通 RPC 请求，并把执行前
+的 deadline 检查从 `RpcRequestHandler` 迁移为第一个内置 Filter。保持业务线程池隔离、
+请求排空计数、响应写回以及执行期间的协作式 deadline 检查行为。
+
+#### 主要修改
+
+- 新增 `ProviderDeadlineFilter`：deadline 大于 0 且当前时间已达到截止时间时，
+  直接返回携带原 requestId 的失败响应；旧请求的 deadline 为 0 时继续执行；
+- `NettyRpcServerHandler` 构造时组装一次
+  `ProviderDeadlineFilter → RpcRequestHandler`，业务线程执行任务时调用根链的
+  `proceed(request)`；Netty EventLoop 仍只负责投递任务；
+- 移除 `RpcRequestHandler` 内部的执行前 deadline 判断；它保留服务查找、方法反射、
+  响应封装，以及执行方法时的 `RpcCallContext` 绑定和清理；
+- 更新原 deadline 测试，使过期和未过期请求通过真实 Filter 链验证；
+- 为 `NettyRpcServerHandlerDrainTest` 增加过期请求测试，验证业务任务运行前不执行
+  Filter，运行后短路并正确归还在途计数；
+- 新增真实 TCP 集成测试 `NettyProviderDeadlineFilterIntegrationTest`：使用真正的
+  Netty Consumer/Provider，先发送过期请求，再在同一连接上发送正常请求；
+- 同步更新 README 和根开发记录索引；`PRODUCTION_READINESS_GAP.md` 保持
+  3.37 阶段的历史评估快照，不把当前实现误写进当时的结论。
+
+#### 行为变化与调用链
+
+```text
+Netty worker：RpcDecoder → NettyRpcServerHandler → 投递到业务线程池
+业务线程：DefaultProviderFilterChain
+                  ↓
+           ProviderDeadlineFilter
+                  ↓ 未过期
+           RpcRequestHandler → @RpcService 方法
+                  ↓
+           RpcResponse → Netty Channel 写回
+```
+
+如果请求在业务线程池排队期间到达 deadline，Filter 在任务真正开始时短路，服务
+方法不会执行。失败响应仍使用请求的 requestId；写回完成后仍通过原有逻辑减少在途
+计数。正常请求仍会进入原处理器，服务方法运行期间仍可主动调用
+`RpcCallContext.checkDeadline()`。
+
+#### 设计原因
+
+- 执行前 deadline 是所有 Provider 方法共有的检查，放在 Filter 更便于以后加入
+  指标、鉴权等横切节点，同时让 `RpcRequestHandler` 聚焦服务定位和方法调用；
+- 在业务线程而不是 EventLoop 中检查，才能覆盖排队造成的过期，也不会把未来可能
+  耗时的 Filter 放在 Netty I/O 线程上；
+- 根链在 Handler 构造时组装一次，列表和链位置不可变，多个 Channel 的业务任务可
+  复用它；Filter 自身若将来保存共享状态，仍须自行保证线程安全；
+- 只调整 `executeAndRespond` 内的业务执行入口，保留现有过载拒绝、异常转响应和
+  响应写回后的排空计数规则。
+
+#### 验证方式
+
+- 定向运行 `RpcRequestHandlerDeadlineTest`、`NettyRpcServerHandlerDrainTest`、
+  `DefaultProviderFilterChainTest` 和 `NettyProviderDeadlineFilterIntegrationTest`，
+  全部通过；
+- 真实 TCP 集成测试确认过期请求返回 deadline 失败且业务方法执行次数为 0；
+  同一连接上的下一次正常请求成功，业务方法执行次数变为 1；
+- 使用命令级 JVM 内存上限运行根目录 `mvn test`，六个 Maven 模块构建成功；
+- core 66 个测试，0 失败、0 错误，其中 2 个需要 Docker 的 ZooKeeper 端到端
+  用例因当前 Docker 不可用而跳过；Starter 13 个测试全部通过；
+- 两条原有真实 Netty 心跳集成测试继续通过。
+
+#### 当前限制和下一步
+
+- 目前只有内置 `ProviderDeadlineFilter` 被自动组装；用户 Filter 尚不能通过 Spring
+  Bean 加入运行链，也没有排序与启用规则；
+- Consumer Filter 尚未实现；旧 Socket 教学入口直接调用 `RpcRequestHandler`，
+  不经过 Netty 的 Provider Filter 链；
+- 绝对 deadline 仍要求 Consumer 和 Provider 系统时钟基本同步；执行中的业务方法
+  只有主动调用 `RpcCallContext.checkDeadline()` 才能协作终止；
+- 下一步建议 R2-C：在 `RpcClientProxy` 与 `RpcClient` 之间建立 Consumer Filter
+  调用链，保持单引用超时、异常传播和代理返回值行为不变。
+
+### 3.45 R2-C：Consumer Filter 接入动态代理调用路径
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+在 Consumer 动态代理完成 `RpcRequest` 构造后、交给 `RpcClient` 发送前建立一条
+可短路、可执行前后置逻辑的责任链。保持原有默认超时、单引用超时、异常向上传递和
+代理方法返回值的行为。该阶段只提供 core 手动组装入口，不同时接入 Spring Bean。
+
+#### 主要修改
+
+- 新增 `ConsumerFilter` 和 `ConsumerFilterChain`，用 `proceed(request)` 表示进入
+  下一个节点或最终网络发送；
+- 新增 `DefaultConsumerFilterChain`：根链持有不可变的 Filter 列表和当前代理引用的
+  超时覆盖值，每个剩余节点使用自己的不可变下标；
+- 链的终点沿用原来的两个 `RpcClient.sendRequest` 入口：没有单引用覆盖值时调用
+  单参数方法，有覆盖值时调用带 `Duration` 的方法；
+- `RpcClientProxy` 现在把构造完成的请求交给根链；原有构造方法全部委托到空 Filter
+  列表，并新增可传入固定顺序 Filter 列表的五参数 core 构造方法；
+- 新增 `ConsumerFilterChainTest`，覆盖两层 Filter 的前后置执行顺序、单引用超时
+  传递、Filter 短路以及网络异常仍触发 Filter 清理逻辑；
+- README 同步更新模块说明、完整调用链、当前限制和下一步。
+
+#### 行为变化与调用链
+
+```text
+业务方法 → RpcClientProxy 构造 RpcRequest
+              ↓
+          ConsumerFilter[0] → ConsumerFilter[1] → ...
+              ↓
+          RpcClient.sendRequest(request[, timeout])
+              ↓
+          响应反向经过 Filter，最后由代理返回 data 或抛出 RpcException
+```
+
+Filter 不调用 `chain.proceed(request)` 时，可以直接返回失败响应并阻止网络发送。
+Filter 调用下一节点后可在返回路径记录耗时；网络调用抛出运行时异常时，异常会原样
+向上传播，Filter 使用 `finally` 仍可完成清理。`toString`、`equals` 和 `hashCode`
+等代理对象本地方法仍不会进入 RPC 链。
+
+#### 设计原因
+
+- 日志、指标和追踪需要围绕完整的 Consumer 远程调用执行，放在代理和 RpcClient
+  之间可以覆盖服务发现、建连、等待响应等环节；
+- 超时覆盖值属于单个服务引用，保存在该代理专属的根链中，避免多个引用共享一个
+  RpcClient 时互相覆盖配置；
+- 与 Provider 链一致，使用不可变过滤器快照和不可变位置，多个业务线程可复用
+  同一代理；Filter 实例自己的可变状态仍由实现者负责线程安全；
+- 空链保留所有已有入口语义，先验证责任链的行为，再单独实现 Starter 的 Spring
+  Bean 收集和排序，方便逐步审核。
+
+#### 验证方式
+
+- 定向运行 `ConsumerFilterChainTest` 和 `RpcClientProxyTimeoutTest`，均通过；
+- 验证 `first-before → second-before → transport → second-after → first-after`
+  的执行顺序，以及单引用 750ms 超时仍传到 RpcClient 的带 Duration 重载；
+- 验证短路后 RpcClient 调用次数为 0，失败响应仍由代理转换成 RpcException；
+- 验证网络异常向上传递时，同一个异常对象被调用方接收，Filter 的 `finally`
+  清理逻辑正常执行；
+- 使用命令级 JVM 内存上限执行根目录 `mvn test`，六个 Maven 模块全部成功；
+- core 69 个测试中 67 个通过、2 个 Docker 用例因当前 Docker 不可用而跳过；
+  Starter 13 个测试全部通过，总计 80 个通过、2 个跳过，0 失败、0 错误。
+
+#### 当前限制和下一步
+
+- Starter 尚未自动收集用户声明的 Consumer/Provider Filter Bean；当前 Spring
+  业务代码使用空 Consumer 链和仅包含内置 deadline 的 Provider 链；
+- core 的五参数构造方法可手动指定 Consumer Filter 列表，`RpcClientFactory`
+  尚未提供 Filter 配置入口；直接调用 `RpcClient.sendRequest` 不经过代理链；
+- 当前 Filter 不应多次调用 `proceed`，否则可能重复发送非幂等请求；框架没有
+  自动重试，也不提供隐式业务幂等保证；
+- 下一步建议 R2-D：让 Starter 按确定顺序收集两侧 Spring Bean Filter，并保证
+  Provider 内置 deadline Filter 始终位于用户 Filter 前面。
+
+### 3.46 R2-D：Starter 自动收集并排序 Filter Bean
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+让 Spring Boot 业务项目只需声明 `ConsumerFilter` 或 `ProviderFilter` Bean，就能把
+自定义横切逻辑接入真实 RPC 调用链；通过 Spring `@Order`/`Ordered` 得到确定顺序，
+同时保证 Provider 内置 deadline 检查始终先于用户 Filter。
+
+#### 主要修改
+
+- `MiniRpcAutoConfiguration` 使用 `ObjectProvider.orderedStream()` 分别收集两侧
+  Filter Bean，形成一次性有序列表快照；没有相应 Bean 时得到空列表；
+- `RpcClientFactory` 新增接收 `List<ConsumerFilter>` 的完整构造方法，并把同一份
+  不可变列表交给默认路由代理以及每个带 group/version/timeout 的引用代理；
+- `RpcProvider` 和 `NettyRpcServer` 新增接收 `List<ProviderFilter>` 的构造入口，
+  最终传给 `NettyRpcServerHandler`；
+- `NettyRpcServerHandler` 将内置 `ProviderDeadlineFilter` 放在用户 Filter 列表最前面，
+  再构造一次可并发复用的 `DefaultProviderFilterChain`；
+- 所有旧构造方法继续委托到空用户 Filter 列表，避免破坏纯 Java 教学入口；
+- 新增 Starter 排序测试，故意按“晚、早”的顺序注册 Bean，验证最终按
+  `@Order(10)`、`@Order(20)` 排列；
+- 扩展 Provider Handler 测试，验证过期请求在第一个内置 Filter 短路，用户 Filter
+  与真实请求处理器均不会执行；
+- 同步更新 README 的扩展方式、完整调用链、当前限制和下一步。
+
+#### 行为变化与调用链
+
+Consumer：
+
+```text
+@RpcReference 动态代理
+    → 用户 ConsumerFilter（按 @Order 从小到大）
+    → RpcClient.sendRequest(...)
+    → 响应按相反嵌套方向经过 Filter 后置逻辑
+```
+
+Provider：
+
+```text
+NettyRpcServerHandler → Provider 业务线程池
+    → ProviderDeadlineFilter（框架固定第一位）
+    → 用户 ProviderFilter（按 @Order 从小到大）
+    → RpcRequestHandler → @RpcService 方法
+```
+
+Provider 请求已经过期时，不进入任何用户 Filter；未过期时才继续执行用户节点。
+用户没有声明 Filter Bean 时，Consumer 直接发送，Provider 仍保留内置 deadline
+检查，原有项目行为不变。
+
+#### 设计原因
+
+- 自动收集属于 Spring 装配职责，放在 Starter；core 只接收普通 `List`，继续保持
+  不依赖 Spring，纯 Java 用户也可以手动组装；
+- 使用 Spring 已有的 `@Order`/`Ordered` 规则，避免框架重复设计一套顺序注解；
+- 构造时生成不可变快照，而不是每次请求查询容器，避免在高频调用路径引入 Bean
+  查找和排序开销；
+- deadline 固定在 Provider 首位，保证已经没有执行价值的请求不会触发用户鉴权、
+  日志或其他可能产生副作用的 Filter；
+- 两侧 Filter Bean 都是单例并被并发调用，因此单次请求状态必须使用局部变量，
+  Filter 自身的共享可变状态需要实现者保证线程安全。
+
+#### 验证方式
+
+- 定向执行 `ConsumerFilterChainTest`、`DefaultProviderFilterChainTest`、
+  `NettyRpcServerHandlerDrainTest` 和 `MiniRpcAutoConfigurationTest`，全部通过；
+- 验证 Spring 注册顺序与最终 Filter 顺序不同时，`@Order` 仍决定调用顺序；
+- 验证过期请求的用户 Provider Filter 调用次数和请求处理器调用次数均为 0；
+- 执行 `git diff --check`，未发现空白错误；换行符提示是仓库当前 Windows
+  工作区的 LF/CRLF 转换提醒，不是代码错误；
+- 执行根目录 `mvn clean test`，六个 Maven 模块构建成功；core 69 个测试中
+  67 个通过、2 个依赖 Docker 的 ZooKeeper 端到端测试跳过，Starter 14 个测试
+  全部通过，总计 81 个通过、2 个跳过，0 失败、0 错误。
+
+#### 当前限制和下一步
+
+- Filter 当前是全局扩展：某一侧声明的 Bean 会作用于该进程的全部 RPC 调用，尚无
+  按服务、方法、group/version 或配置条件匹配的激活规则；
+- 框架只定义扩展链，尚未提供开箱即用的日志、指标、链路追踪或鉴权 Filter；
+- Filter 必须只调用一次 `chain.proceed(request)`；多次调用可能重复发送请求或执行
+  服务方法，框架暂不为自定义错误用法增加额外状态机；
+- 旧 Socket 教学入口仍直接调用 `RpcRequestHandler`，不经过 Netty Provider 链；
+- 下一步建议进入 R3-A：基于现有 Filter 链增加最小 Micrometer 指标，先统计
+  Consumer/Provider 请求总数、成功/失败和调用耗时，不同时加入追踪、熔断等功能。

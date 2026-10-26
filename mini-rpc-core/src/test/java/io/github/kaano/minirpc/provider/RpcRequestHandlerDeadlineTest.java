@@ -3,7 +3,11 @@ package io.github.kaano.minirpc.provider;
 import io.github.kaano.minirpc.common.RpcRequest;
 import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.common.ServiceKey;
+import io.github.kaano.minirpc.provider.filter.DefaultProviderFilterChain;
+import io.github.kaano.minirpc.provider.filter.ProviderDeadlineFilter;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -13,7 +17,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
-/** 验证 Provider 不会执行在到达业务处理阶段前已经过期的请求。 */
+/** 验证执行前的 Filter 检查和业务执行期间的调用上下文。 */
 class RpcRequestHandlerDeadlineTest {
 
     @Test
@@ -31,7 +35,10 @@ class RpcRequestHandlerDeadlineTest {
                 .deadlineEpochMillis(System.currentTimeMillis() - 1)
                 .build();
 
-        RpcResponse response = requestHandler.handle(expiredRequest);
+        RpcResponse response = new DefaultProviderFilterChain(
+                List.of(new ProviderDeadlineFilter()),
+                requestHandler
+        ).proceed(expiredRequest);
 
         assertEquals(RpcResponse.FAILURE_CODE, response.getCode());
         assertEquals(301L, response.getRequestId());
@@ -60,7 +67,10 @@ class RpcRequestHandlerDeadlineTest {
                 .deadlineEpochMillis(System.currentTimeMillis() + 10_000)
                 .build();
 
-        RpcResponse response = requestHandler.handle(validRequest);
+        RpcResponse response = new DefaultProviderFilterChain(
+                List.of(new ProviderDeadlineFilter()),
+                requestHandler
+        ).proceed(validRequest);
 
         assertEquals(RpcResponse.SUCCESS_CODE, response.getCode());
         assertEquals("hello", response.getData());

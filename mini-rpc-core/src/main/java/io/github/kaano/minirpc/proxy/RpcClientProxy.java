@@ -4,11 +4,15 @@ import io.github.kaano.minirpc.common.RpcException;
 import io.github.kaano.minirpc.common.RpcRequest;
 import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.common.ServiceKey;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilterChain;
+import io.github.kaano.minirpc.proxy.filter.DefaultConsumerFilterChain;
 import io.github.kaano.minirpc.transport.client.RpcClient;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -16,12 +20,14 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>调用方拿到的不是服务实现对象，而是 JDK 在运行时创建的代理对象。
  * 当调用代理对象的方法时，代理会收集接口名、方法名和参数等信息，组装
- * {@link RpcRequest}，再交给 {@link RpcClient} 发送。</p>
+ * {@link RpcRequest}，交给 Consumer Filter 链，最终由 {@link RpcClient} 发送。</p>
  *
  * <pre>
  * helloService.sayHello("world")
  *              ↓ 动态代理拦截
  * RpcRequest(interfaceName, methodName, parameterTypes, parameters...)
+ *              ↓
+ * ConsumerFilterChain
  *              ↓
  * RpcClient.sendRequest(request)
  *              ↓
@@ -38,19 +44,14 @@ public class RpcClientProxy {
      */
     private static final AtomicLong REQUEST_ID_GENERATOR = new AtomicLong();
 
-    /** 真正负责网络收发的客户端实现。 */
-    private final RpcClient rpcClient;
+    /** 代理构造请求后进入的根链，终点复用 RpcClient。 */
+    private final ConsumerFilterChain requestChain;
 
     /** 当前代理调用的服务分组。 */
     private final String group;
 
     /** 当前代理调用的服务版本；Provider 本地服务表会据此精确查找。 */
     private final String version;
-
-    /**
-     * 当前引用单独指定的响应超时；为 {@code null} 时使用 RpcClient 的全局默认值。
-     */
-    private final Duration requestTimeoutOverride;
 
     /**
      * 使用默认分组 default 和默认版本 1.0 创建代理工厂。
@@ -120,6 +121,22 @@ public class RpcClientProxy {
             String version,
             Duration requestTimeoutOverride
     ) {
+        this(rpcClient, group, version, requestTimeoutOverride, List.of());
+    }
+
+    /**
+     * 使用固定顺序的 Consumer Filter 创建代理。
+     *
+     * <p>这一步只提供 core 手动组装入口；Starter 尚不会自动收集 Spring Filter Bean。
+     * 列表为空时，调用链直接进入 RpcClient，既有代理构造方法保持原有行为。</p>
+     */
+    public RpcClientProxy(
+            RpcClient rpcClient,
+            String group,
+            String version,
+            Duration requestTimeoutOverride,
+            List<ConsumerFilter> filters
+    ) {
         if (rpcClient == null) {
             throw new RpcException("RpcClient 不能为空");
         }
@@ -130,11 +147,12 @@ public class RpcClientProxy {
             throw new RpcException("服务版本不能为空");
         }
 
-        this.rpcClient = rpcClient;
         this.group = group.trim();
         this.version = version.trim();
-        this.requestTimeoutOverride = validateRequestTimeout(
-                requestTimeoutOverride
+        this.requestChain = new DefaultConsumerFilterChain(
+                filters,
+                rpcClient,
+                validateRequestTimeout(requestTimeoutOverride)
         );
     }
 
@@ -219,12 +237,7 @@ public class RpcClientProxy {
                 .version(version)
                 .build();
 
-        RpcResponse response = requestTimeoutOverride == null
-                ? rpcClient.sendRequest(request)
-                : rpcClient.sendRequest(request, requestTimeoutOverride);
-        if (response == null) {
-            throw new RpcException("RpcClient 返回的 RpcResponse 不能为空");
-        }
+        RpcResponse response = requestChain.proceed(request);
 
         if (response.getCode() != RpcResponse.SUCCESS_CODE) {
             throw createRemoteException(response);

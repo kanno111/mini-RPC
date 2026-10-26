@@ -2,9 +2,15 @@ package io.github.kaano.minirpc.spring.autoconfigure;
 
 import io.github.kaano.minirpc.annotation.RpcReference;
 import io.github.kaano.minirpc.client.RpcClientFactory;
+import io.github.kaano.minirpc.common.RpcRequest;
+import io.github.kaano.minirpc.common.RpcResponse;
 import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
+import io.github.kaano.minirpc.provider.filter.ProviderFilter;
+import io.github.kaano.minirpc.provider.filter.ProviderFilterChain;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
+import io.github.kaano.minirpc.proxy.filter.ConsumerFilterChain;
 import io.github.kaano.minirpc.registry.ServiceAddress;
 import io.github.kaano.minirpc.serialize.JdkSerializer;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
@@ -15,8 +21,10 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -155,6 +163,39 @@ class MiniRpcAutoConfigurationTest {
                     assertThat(context).hasSingleBean(LoadBalance.class);
                     assertThat(context.getBean(LoadBalance.class))
                             .isSameAs(customLoadBalance);
+                });
+    }
+
+    @Test
+    void shouldCollectConsumerAndProviderFiltersBySpringOrder() {
+        contextRunner
+                // 故意按“晚、早”的顺序注册，证明结果由 @Order 而非注册顺序决定。
+                .withBean(LateConsumerFilter.class, LateConsumerFilter::new)
+                .withBean(EarlyConsumerFilter.class, EarlyConsumerFilter::new)
+                .withBean(LateProviderFilter.class, LateProviderFilter::new)
+                .withBean(EarlyProviderFilter.class, EarlyProviderFilter::new)
+                .run(context -> {
+                    List<ConsumerFilter> consumerFilters =
+                            MiniRpcAutoConfiguration.collectOrderedFilters(
+                                    context.getBeanProvider(ConsumerFilter.class)
+                            );
+                    assertThat(consumerFilters)
+                            .extracting(Object::getClass)
+                            .containsExactly(
+                                    EarlyConsumerFilter.class,
+                                    LateConsumerFilter.class
+                            );
+
+                    List<ProviderFilter> providerFilters =
+                            MiniRpcAutoConfiguration.collectOrderedFilters(
+                                    context.getBeanProvider(ProviderFilter.class)
+                            );
+                    assertThat(providerFilters)
+                            .extracting(Object::getClass)
+                            .containsExactly(
+                                    EarlyProviderFilter.class,
+                                    LateProviderFilter.class
+                            );
                 });
     }
 
@@ -298,5 +339,37 @@ class MiniRpcAutoConfigurationTest {
 
         @RpcReference
         private Runnable remoteService;
+    }
+
+    @Order(10)
+    static final class EarlyConsumerFilter implements ConsumerFilter {
+        @Override
+        public RpcResponse filter(RpcRequest request, ConsumerFilterChain chain) {
+            return chain.proceed(request);
+        }
+    }
+
+    @Order(20)
+    static final class LateConsumerFilter implements ConsumerFilter {
+        @Override
+        public RpcResponse filter(RpcRequest request, ConsumerFilterChain chain) {
+            return chain.proceed(request);
+        }
+    }
+
+    @Order(10)
+    static final class EarlyProviderFilter implements ProviderFilter {
+        @Override
+        public RpcResponse filter(RpcRequest request, ProviderFilterChain chain) {
+            return chain.proceed(request);
+        }
+    }
+
+    @Order(20)
+    static final class LateProviderFilter implements ProviderFilter {
+        @Override
+        public RpcResponse filter(RpcRequest request, ProviderFilterChain chain) {
+            return chain.proceed(request);
+        }
     }
 }
