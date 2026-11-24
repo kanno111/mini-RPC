@@ -539,6 +539,50 @@ public final class RpcProvider implements AutoCloseable {
     }
 
     /**
+     * 返回当前 Provider 尚未完成响应写回的请求数量。
+     *
+     * <p>Spring Starter 使用该只读入口绑定 Micrometer Gauge。正式运行路径使用
+     * {@link NettyRpcServer}，因此返回的就是优雅关闭正在等待的同一份在途计数。
+     * 单元测试或早期教学代码如果注入其他 {@link RpcServer} 实现，则没有 Netty
+     * 在途跟踪能力，兼容返回 0。</p>
+     */
+    public int getInFlightRequestCount() {
+        if (rpcServer instanceof NettyRpcServer nettyRpcServer) {
+            return nettyRpcServer.getInFlightRequestCount();
+        }
+        return 0;
+    }
+
+    /**
+     * 返回当前正在执行 RPC 业务任务的线程数。
+     *
+     * <p>该入口只暴露整数快照，不把线程池对象交给 Starter。非 Netty 教学入口
+     * 没有独立的 Provider 业务线程池，因此兼容返回 0。</p>
+     */
+    public int getActiveBusinessThreadCount() {
+        if (rpcServer instanceof NettyRpcServer nettyRpcServer) {
+            return nettyRpcServer.getActiveBusinessThreadCount();
+        }
+        return 0;
+    }
+
+    /** 返回当前仍在 Provider 有界业务队列中等待执行的任务数。 */
+    public int getQueuedBusinessTaskCount() {
+        if (rpcServer instanceof NettyRpcServer nettyRpcServer) {
+            return nettyRpcServer.getQueuedBusinessTaskCount();
+        }
+        return 0;
+    }
+
+    /** 返回当前 Provider 实例启动以来业务线程池累计拒绝的任务数。 */
+    public long getRejectedBusinessTaskCount() {
+        if (rpcServer instanceof NettyRpcServer nettyRpcServer) {
+            return nettyRpcServer.getRejectedBusinessTaskCount();
+        }
+        return 0L;
+    }
+
+    /**
      * 按“先摘流、再停服务、最后关注册中心”的顺序关闭 Provider。
      *
      * <ol>

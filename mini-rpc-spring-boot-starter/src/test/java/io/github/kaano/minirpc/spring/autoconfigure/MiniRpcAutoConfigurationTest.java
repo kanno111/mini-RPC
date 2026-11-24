@@ -8,6 +8,8 @@ import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
 import io.github.kaano.minirpc.metrics.ConsumerMetricsFilter;
+import io.github.kaano.minirpc.metrics.ProviderBusinessExecutorMetrics;
+import io.github.kaano.minirpc.metrics.ProviderInFlightMetrics;
 import io.github.kaano.minirpc.metrics.ProviderMetricsFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilterChain;
@@ -17,6 +19,7 @@ import io.github.kaano.minirpc.registry.ServiceAddress;
 import io.github.kaano.minirpc.serialize.JdkSerializer;
 import io.github.kaano.minirpc.serialize.JsonSerializer;
 import io.github.kaano.minirpc.serialize.Serializer;
+import io.github.kaano.minirpc.server.RpcProvider;
 import io.github.kaano.minirpc.transport.client.NettyRpcClient;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -29,10 +32,14 @@ import org.springframework.core.annotation.Order;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * 验证 Starter 最基础的两件事：自动配置可以生效，配置文件中的值可以绑定。
@@ -178,6 +185,9 @@ class MiniRpcAutoConfigurationTest {
                     .isInstanceOf(SimpleMeterRegistry.class);
             assertThat(context).hasSingleBean(ConsumerMetricsFilter.class);
             assertThat(context).hasSingleBean(ProviderMetricsFilter.class);
+            assertThat(context).doesNotHaveBean(
+                    ProviderBusinessExecutorMetrics.class
+            );
         });
     }
 
@@ -197,6 +207,99 @@ class MiniRpcAutoConfigurationTest {
                     assertThat(context).hasSingleBean(
                             ProviderMetricsFilter.class
                     );
+                });
+    }
+
+    @Test
+    void shouldAutoConfigureProviderInFlightGaugeFromRpcProvider() {
+        AtomicInteger currentInFlightRequests = new AtomicInteger(3);
+        RpcProvider rpcProvider = mock(RpcProvider.class);
+        when(rpcProvider.getInFlightRequestCount()).thenAnswer(
+                ignoredInvocation -> currentInFlightRequests.get()
+        );
+
+        contextRunner
+                .withPropertyValues("mini-rpc.provider-enabled=true")
+                // Provider 扫描会发现测试夹具，它的构造器需要该依赖。
+                .withBean(String.class, () -> "metrics-test-dependency")
+                .withBean(RpcProvider.class, () -> rpcProvider)
+                // 避免本测试启动 Provider 后台线程；这里只验证指标自动装配。
+                .withBean(
+                        SpringRpcProviderLifecycle.class,
+                        () -> mock(SpringRpcProviderLifecycle.class)
+                )
+                .run(context -> {
+                    assertThat(context).hasSingleBean(
+                            ProviderInFlightMetrics.class
+                    );
+                    MeterRegistry registry = context.getBean(
+                            MeterRegistry.class
+                    );
+                    assertThat(registry.get(
+                            ProviderInFlightMetrics.IN_FLIGHT_REQUESTS_METRIC
+                    ).gauge().value()).isEqualTo(3.0);
+
+                    currentInFlightRequests.set(1);
+                    assertThat(registry.get(
+                            ProviderInFlightMetrics.IN_FLIGHT_REQUESTS_METRIC
+                    ).gauge().value()).isEqualTo(1.0);
+                });
+    }
+
+    @Test
+    void shouldAutoConfigureProviderBusinessExecutorMetrics() {
+        AtomicInteger activeThreads = new AtomicInteger(2);
+        AtomicInteger queuedTasks = new AtomicInteger(5);
+        AtomicLong rejectedTasks = new AtomicLong(3);
+        RpcProvider rpcProvider = mock(RpcProvider.class);
+        when(rpcProvider.getActiveBusinessThreadCount()).thenAnswer(
+                ignoredInvocation -> activeThreads.get()
+        );
+        when(rpcProvider.getQueuedBusinessTaskCount()).thenAnswer(
+                ignoredInvocation -> queuedTasks.get()
+        );
+        when(rpcProvider.getRejectedBusinessTaskCount()).thenAnswer(
+                ignoredInvocation -> rejectedTasks.get()
+        );
+
+        contextRunner
+                .withPropertyValues("mini-rpc.provider-enabled=true")
+                .withBean(String.class, () -> "executor-metrics-test")
+                .withBean(RpcProvider.class, () -> rpcProvider)
+                .withBean(
+                        SpringRpcProviderLifecycle.class,
+                        () -> mock(SpringRpcProviderLifecycle.class)
+                )
+                .run(context -> {
+                    assertThat(context).hasSingleBean(
+                            ProviderBusinessExecutorMetrics.class
+                    );
+                    MeterRegistry registry = context.getBean(
+                            MeterRegistry.class
+                    );
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.ACTIVE_THREADS_METRIC
+                    ).gauge().value()).isEqualTo(2.0);
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.QUEUED_TASKS_METRIC
+                    ).gauge().value()).isEqualTo(5.0);
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.REJECTED_TASKS_METRIC
+                    ).functionCounter().count()).isEqualTo(3.0);
+
+                    activeThreads.set(1);
+                    queuedTasks.set(0);
+                    rejectedTasks.set(4);
+
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.ACTIVE_THREADS_METRIC
+                    ).gauge().value()).isEqualTo(1.0);
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.QUEUED_TASKS_METRIC
+                    ).gauge().value()).isEqualTo(0.0);
+                    assertThat(registry.get(
+                            ProviderBusinessExecutorMetrics.REJECTED_TASKS_METRIC
+                    ).functionCounter().count()).isEqualTo(4.0);
                 });
     }
 

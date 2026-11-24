@@ -2,8 +2,10 @@ package io.github.kaano.minirpc.transport.server;
 
 import io.github.kaano.minirpc.common.RpcRequest;
 import io.github.kaano.minirpc.common.RpcResponse;
+import io.github.kaano.minirpc.metrics.ProviderInFlightMetrics;
 import io.github.kaano.minirpc.provider.RpcRequestHandler;
 import io.github.kaano.minirpc.provider.filter.ProviderFilter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
@@ -119,6 +121,11 @@ class NettyRpcServerHandlerDrainTest {
         RpcRequestHandler requestHandler = mock(RpcRequestHandler.class);
         when(requestHandler.handle(request)).thenReturn(expectedResponse);
         InFlightRequestTracker tracker = new InFlightRequestTracker();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        new ProviderInFlightMetrics(
+                registry,
+                tracker::getInFlightRequestCount
+        );
         AtomicReference<Runnable> submittedTask = new AtomicReference<>();
         EmbeddedChannel channel = new EmbeddedChannel(
                 new NettyRpcServerHandler(
@@ -139,6 +146,9 @@ class NettyRpcServerHandlerDrainTest {
             assertNull(channel.readOutbound(),
                     "任务尚未执行时不应提前产生响应");
             assertEquals(1, tracker.getInFlightRequestCount());
+            assertEquals(1.0, registry.get(
+                    ProviderInFlightMetrics.IN_FLIGHT_REQUESTS_METRIC
+            ).gauge().value());
             verifyNoInteractions(requestHandler);
 
             submittedTask.get().run();
@@ -146,6 +156,9 @@ class NettyRpcServerHandlerDrainTest {
 
             assertEquals(expectedResponse, channel.readOutbound());
             assertEquals(0, tracker.getInFlightRequestCount());
+            assertEquals(0.0, registry.get(
+                    ProviderInFlightMetrics.IN_FLIGHT_REQUESTS_METRIC
+            ).gauge().value());
             verify(requestHandler).handle(request);
         } finally {
             channel.finishAndReleaseAll();

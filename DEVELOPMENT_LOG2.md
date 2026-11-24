@@ -1487,7 +1487,7 @@ Provider 请求已经过期时，不进入任何用户 Filter；未过期时才�
 ### 3.47 R3-A：Consumer/Provider 最小 Micrometer 指标
 
 - 日期：2026-10-26
-- 对应提交：尚未提交
+- 对应提交：`4b9bf01`
 - 状态：已实现并验证
 
 #### 目标
@@ -1579,3 +1579,251 @@ Provider 业务线程
 - 旧 Socket 教学入口不经过 Netty Provider Filter 链，因此不会记录 Provider 指标；
 - 下一步建议单独实施 R3-B：为现有 `InFlightRequestTracker` 和
   `ProviderBusinessExecutor` 增加只读 Gauge，不在同一步部署监控基础设施。
+
+### 3.48 R3-B-A：Provider 当前在途请求 Gauge
+
+- 日期：2026-10-26
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+把 Provider 优雅关闭已经维护的在途请求数接入 Micrometer，形成
+`mini.rpc.provider.requests.inflight` Gauge。该指标回答“此刻还有多少请求未完成”，
+会随请求进入和响应完成上下波动。本步只接入这一项当前值，不同时增加业务线程池
+指标、Actuator、Prometheus 或 Grafana。
+
+#### 主要修改
+
+- 新增 `ProviderInFlightMetrics`，接收一个只读 `IntSupplier` 并注册在途请求 Gauge；
+  它不保存、增加或减少第二份计数；
+- `NettyRpcServer` 新增只读 `getInFlightRequestCount()`，内部仍从原有
+  `InFlightRequestTracker` 取得同步快照，不暴露 Tracker 对象或修改方法；
+- `RpcProvider` 新增同名只读入口，把 Starter 与 Netty 传输层隔开；正式 Netty 路径
+  返回真实值，测试或旧教学代码注入非 Netty `RpcServer` 时兼容返回 0；
+- Starter 仅在 `mini-rpc.provider-enabled=true` 时自动创建
+  `ProviderInFlightMetrics`，通过方法引用绑定 Spring 管理的同一个 `RpcProvider`；
+- 新增独立 Gauge 测试，验证采样值可以按 `0 → 4 → 1 → 0` 增减；
+- 扩展真实 Handler 排空测试，验证任务排队期间 Gauge 为 1、响应写回后为 0；
+- 扩展 Starter 自动配置测试，验证 Provider 开启时自动注册 Gauge，并持续读取
+  `RpcProvider` 的最新值；
+- README 同步更新完成度、指标表、Gauge 行为、限制和下一步。
+
+#### 行为变化与数据来源
+
+```text
+普通 RpcRequest 被 NettyRpcServerHandler 接受
+    → InFlightRequestTracker.tryStartRequest()：当前值 + 1
+    → 业务线程池排队
+    → Provider Filter 与 @RpcService 方法
+    → Netty 写回 RpcResponse
+    → 写操作完成监听器调用 finishRequest()：当前值 - 1
+
+Micrometer 采样
+    → ProviderInFlightMetrics
+    → RpcProvider.getInFlightRequestCount()
+    → NettyRpcServer.getInFlightRequestCount()
+    → 读取同一个 InFlightRequestTracker 当前值
+```
+
+因此 Gauge 包含业务线程池排队、业务执行和响应写回阶段，不包含心跳消息；Provider
+进入关闭排空后拒绝的新请求没有取得执行许可，也不会增加 Gauge。
+
+#### 设计原因
+
+- 优雅关闭和监控必须共用一个事实来源；如果指标 Filter 另算一份计数，会漏掉业务
+  线程池排队和响应写回阶段，也可能与关闭逻辑看到的数字不一致；
+- Gauge 适合可增可减的当前状态，Counter 适合只增不减的累计请求数，不能混用；
+- 上层只获得整数快照，不获得 `InFlightRequestTracker` 实例，避免指标代码意外调用
+  `tryStartRequest()`、`finishRequest()` 或 `beginDraining()` 改变传输层状态；
+- Gauge 只在 Provider 开启时装配，纯 Consumer 进程不会出现没有意义的 Provider
+  在途指标。
+
+#### 验证方式
+
+- 定向执行 `ProviderInFlightMetricsTest` 和 `NettyRpcServerHandlerDrainTest`，6 个测试
+  全部通过；
+- 验证 Gauge 会读取最新值而不是累计历史值，并验证真实 Handler 接受请求到响应
+  写回完成的 `1 → 0` 变化；
+- 定向执行 `MiniRpcAutoConfigurationTest`，15 个测试全部通过；Provider 开启时
+  自动创建 Gauge，测试值从 3 改为 1 后再次采样能够立即读到 1；
+- 执行根目录 `mvn clean test`，六个 Maven 模块全部构建成功；core 74 个测试中
+  72 个通过、2 个依赖 Docker 的 ZooKeeper 端到端测试跳过，Starter 17 个测试
+  全部通过，总计 89 个通过、2 个跳过，0 失败、0 错误；
+- Mockito 仍会提示动态加载 Java Agent 的未来兼容性警告，不影响当前测试结果。
+
+#### 当前限制和下一步
+
+- 默认 `SimpleMeterRegistry` 仍只保存在当前 JVM 内存，没有 HTTP 查询端点和历史数据；
+- Gauge 是当前 Provider 进程的聚合值，没有按接口、方法、group/version 拆分；
+- 尚未记录业务线程池活跃线程、等待队列长度和拒绝次数；
+- 下一步建议实施 R3-B-B：把 `ProviderBusinessExecutor` 已有运行快照接入 Micrometer，
+  仍不同时部署 Prometheus 或 Grafana。
+
+### 3.49 R3-B-B：Provider 业务线程池运行指标
+
+- 日期：2026-11-01
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+把 Provider 有界业务线程池已经维护的活跃线程数、排队任务数和累计拒绝次数接入
+Micrometer。让维护者能够区分“请求正在正常执行”“线程已满并开始排队”和“线程、
+队列都满而发生拒绝”三种运行状态。本步只开放核心指标，不同时引入 Actuator、
+Prometheus、Grafana 或告警规则。
+
+#### 主要修改
+
+- 新增 `ProviderBusinessExecutorMetrics`，注册
+  `mini.rpc.provider.executor.active`、`mini.rpc.provider.executor.queued` 和
+  `mini.rpc.provider.executor.rejected`；
+- 活跃线程数和排队任务数使用 Gauge，累计拒绝次数使用 FunctionCounter；
+- `NettyRpcServer` 增加三个只读查询入口，数据继续来自
+  `ProviderBusinessExecutor.snapshot()`，不暴露线程池对象；
+- `RpcProvider` 增加对应只读入口，把 Spring Starter 与 Netty 传输层隔开；非 Netty
+  教学入口没有这组线程池状态，兼容返回 0；
+- Starter 仅在 `mini-rpc.provider-enabled=true` 时自动创建线程池指标 Bean，通过
+  方法引用持续读取 Spring 管理的同一个 `RpcProvider`；
+- 新增指标单元测试并扩展 Starter 自动配置测试，验证指标类型、实时采样和条件装配；
+- README 同步更新完成状态、指标表、指标语义、当前限制和下一步。
+
+#### 行为变化与数据来源
+
+```text
+NettyRpcServerHandler
+    → ProviderBusinessExecutor.execute(task)
+        ├── 工作线程空闲：active 增加
+        ├── 工作线程全忙：queued 增加
+        └── 工作线程和有界队列都满：rejected 累加并快速失败
+
+Micrometer 采样
+    → ProviderBusinessExecutorMetrics
+    → RpcProvider 三个只读查询入口
+    → NettyRpcServer
+    → ProviderBusinessExecutor.snapshot()
+```
+
+`active` 和 `queued` 会随任务执行上下变化；`rejected` 记录当前 Provider 实例启动
+以来累计拒绝数，只会增加。拒绝既可能来自容量饱和，也可能来自关闭期间的提交竞争。
+指标采样不会改变任务投递、拒绝策略或优雅关闭行为。
+
+#### 设计原因
+
+- 线程池快照原本已经服务于过载日志，监控继续读取同一个事实来源，避免日志和指标
+  各维护一套可能漂移的统计；
+- Gauge 表达“此刻有多少”，适合活跃线程和队列长度；FunctionCounter 表达外部状态
+  中只增不减的累计值，适合拒绝次数；
+- Starter 只获得数值查询函数，不获得 `ThreadPoolExecutor`，避免监控装配代码修改
+  线程数、清空队列或关闭线程池；
+- 三项指标保持 Provider 进程级聚合，不增加服务或方法标签，避免当前阶段引入高基数
+  和线程池并未按服务隔离时的伪精度。
+
+#### 验证方式
+
+- `ProviderBusinessExecutorMetricsTest` 验证两个 Gauge 能上下变化，FunctionCounter 能
+  读取不断增加的拒绝总数；
+- `ProviderBusinessExecutorTest` 继续验证一个工作线程和容量为一的队列同时占满时，
+  快照为 active=1、queued=1、rejected=1；
+- `MiniRpcAutoConfigurationTest` 验证 Provider 开启时自动创建指标 Bean，并持续读取
+  `RpcProvider` 的最新值；
+- 定向执行以上测试：core 4 个、Starter 16 个，全部通过，0 失败、0 错误；
+- 执行根目录 `mvn clean test`，六个 Maven 模块全部构建成功；core 75 个测试中
+  73 个通过、2 个依赖 Docker 的 ZooKeeper 端到端测试跳过，Starter 18 个测试
+  全部通过，总计 91 个通过、2 个跳过，0 失败、0 错误；
+- Mockito 仍会提示动态加载 Java Agent 的未来兼容性警告，不影响当前测试结果。
+
+#### 当前限制和下一步
+
+- 默认 `SimpleMeterRegistry` 仍只把数据保存在当前 JVM，尚不能通过 HTTP 直接查看；
+- 三项指标是单个 Provider 进程的全局值，因为当前也只有一个全局业务线程池；
+- 当前没有使用率、队列容量比例或拒绝率等派生指标，也没有默认告警阈值；
+- `rejected` 同时包含过载拒绝和关闭期间的提交拒绝，尚未按原因拆分；
+- 下一步建议单独接入 Spring Boot Actuator 与 Prometheus Registry，让目前已有指标
+  可以通过 HTTP 查询和抓取，但仍不在同一步部署 Prometheus/Grafana 服务。
+
+### 3.50 根文档分层重构
+
+- 日期：2026-11-24
+- 对应提交：尚未提交
+- 状态：已实现并验证
+
+#### 目标
+
+解决根目录 README 同时承担项目首页、架构教程、配置参考、协议规范、运行手册、
+调试指南和阶段看板而难以浏览的问题。在不删除学习内容的前提下，把文档按读者任务
+分层，让新访问者先理解项目定位和最短使用路径，学习者再按需进入详细文档。
+
+#### 主要修改
+
+- 重写根目录 `README.md`，保留项目定位、核心能力、快速开始、最小使用示例、模块
+  摘要、文档导航、当前状态、主要限制和下一步；
+- 移除 README 中逐阶段完成度大表，完成历史继续由两份开发日志记录；
+- 新增 `docs/getting-started.md`，集中保存环境要求、ZooKeeper、构建、Provider、
+  Consumer、双 Provider 和停机说明；
+- 新增 `docs/architecture.md`，集中保存模块边界、ServiceKey、启动/关闭链路、完整
+  RPC 调用链、线程模型、Filter 顺序和 core 包职责；
+- 新增 `docs/configuration.md`，集中保存全部 `mini-rpc.*` 配置、注解参数、deadline、
+  心跳、业务线程池、优雅停机、扩展 Bean 和 Micrometer 指标；
+- 新增 `docs/protocol.md`，集中说明 20 字节协议头、字段偏移、编解码、半包/粘包、
+  请求响应和心跳消息；
+- 新增 `docs/debugging.md`，集中保存 Provider 启动、Consumer 注入、请求发送、服务端
+  执行、响应返回、心跳和优雅停机的断点顺序；
+- 保留 R3-B-A/R3-B-B 新增的 Provider 在途请求和业务线程池指标说明，没有覆盖当前
+  工作区尚未提交的指标相关文档成果；
+- 按维护者要求，本阶段不新增 License、Contributing、CI 或其他仓库治理文件。
+
+#### 行为变化
+
+本阶段只调整文档信息架构，不修改 Java 代码、配置默认值、依赖或 RPC 运行行为。
+
+```text
+修改前
+README → 同时承载首页、教程、参考手册和历史状态
+
+修改后
+README → 项目入口与最短路径
+       ├── getting-started：运行任务
+       ├── architecture：原理与调用链
+       ├── configuration：配置与扩展点
+       ├── protocol：网络协议
+       └── debugging：源码调试
+```
+
+首次访问者不需要先阅读 core 中每个类的职责就能找到构建和启动方式；需要学习内部
+原理时，仍然可以通过 README 的文档导航进入完整说明。
+
+#### 设计原因
+
+- 根 README 的职责是回答“项目是什么、能做什么、如何开始、详细资料在哪里”，
+  而不是复制全部源码注释和阶段历史；
+- 按“运行、架构、配置、协议、调试”拆分后，每份文档对应一个明确问题，后续修改
+  某项能力时也更容易找到唯一维护位置；
+- 项目面向 RPC 和 Spring 初学者，因此详细调用链和设计解释仍然保留，只改变入口和
+  阅读顺序，不用简单删减换取短 README；
+- README 只保留最小配置，完整默认值与约束集中到配置参考，避免两处同时维护长篇
+  参数解释；
+- 阶段完成历史继续交给开发日志，README 只陈述当前可用能力，减少每完成一个小阶段
+  都要扩展首页表格的问题。
+
+#### 验证方式
+
+- 使用 PowerShell 扫描 README 和五份 `docs` 文档中的 Markdown 相对链接，所有本地
+  文件引用均可解析，没有缺失目标；
+- README 从 1,310 行、45 个标题、47 个代码块收敛为 241 行、17 个标题、12 个
+  代码块；详细内容由五份专题文档承接；
+- 执行 `git diff --check`，文档补丁没有空白错误；
+- 执行根目录 `mvn test`，六个 Maven 模块全部构建成功；core 75 个测试中 73 个
+  通过、2 个依赖 Docker 的 ZooKeeper 端到端测试跳过，Starter 18 个测试全部通过，
+  总计 91 个通过、2 个跳过，0 失败、0 错误；
+- Mockito 仍会提示动态加载 Java Agent 的未来兼容性警告，不影响当前测试结果。
+
+#### 当前限制和下一步
+
+- 当前示例没有声明 Spring Boot Maven Plugin，运行指南仍以 IDEA 主类作为最直接入口，
+  尚未提供一条稳定的命令行启动命令；
+- 文档内容以当前工作区实现为准，后续新增配置、协议字段或调用阶段时必须更新对应的
+  专题文档，并在架构或使用方式变化时同步更新 README；
+- 本阶段没有新增 License、Contributing、CI、发布说明或 Maven Central 坐标；
+- 下一步建议先由维护者审阅文档分层和术语，再单独决定是否为示例增加命令行启动
+  能力，不与本次纯文档重构混在一起。

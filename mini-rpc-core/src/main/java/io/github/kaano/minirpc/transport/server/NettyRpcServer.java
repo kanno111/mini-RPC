@@ -251,6 +251,32 @@ public class NettyRpcServer implements RpcServer {
     }
 
     /**
+     * 返回当前已接收、但响应写回尚未完成的普通 RPC 请求数。
+     *
+     * <p>这里只开放只读值，不把 {@link InFlightRequestTracker} 对象暴露给上层，
+     * 避免指标装配代码错误地增加、减少计数或切换排空状态。返回值包含业务线程池
+     * 排队、Filter/服务方法执行以及响应写回中的请求，不包含心跳消息。</p>
+     */
+    public int getInFlightRequestCount() {
+        return requestTracker.getInFlightRequestCount();
+    }
+
+    /** 返回当前真正占用业务线程执行 RPC 任务的线程数。 */
+    public int getActiveBusinessThreadCount() {
+        return businessExecutor.snapshot().activeThreadCount();
+    }
+
+    /** 返回当前仍在有界业务队列中等待执行的 RPC 任务数。 */
+    public int getQueuedBusinessTaskCount() {
+        return businessExecutor.snapshot().queuedTaskCount();
+    }
+
+    /** 返回当前 Provider 实例启动以来业务线程池累计拒绝的任务数。 */
+    public long getRejectedBusinessTaskCount() {
+        return businessExecutor.snapshot().rejectedTaskCount();
+    }
+
+    /**
      * 启动服务端、绑定端口，并阻塞等待服务端 Channel 关闭。
      *
      * <p>{@code start()} 阻塞当前线程的行为与 M1 的 SocketRpcServer 保持一致，

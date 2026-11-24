@@ -5,6 +5,8 @@ import io.github.kaano.minirpc.loadbalance.LoadBalance;
 import io.github.kaano.minirpc.loadbalance.RandomLoadBalance;
 import io.github.kaano.minirpc.loadbalance.RoundRobinLoadBalance;
 import io.github.kaano.minirpc.metrics.ConsumerMetricsFilter;
+import io.github.kaano.minirpc.metrics.ProviderBusinessExecutorMetrics;
+import io.github.kaano.minirpc.metrics.ProviderInFlightMetrics;
 import io.github.kaano.minirpc.metrics.ProviderMetricsFilter;
 import io.github.kaano.minirpc.provider.filter.ProviderFilter;
 import io.github.kaano.minirpc.proxy.filter.ConsumerFilter;
@@ -103,6 +105,55 @@ public class MiniRpcAutoConfiguration {
             MeterRegistry meterRegistry
     ) {
         return new ProviderMetricsFilter(meterRegistry);
+    }
+
+    /**
+     * 把 Provider 优雅关闭使用的真实在途计数注册成 Micrometer Gauge。
+     *
+     * <p>这里只传递 {@link RpcProvider#getInFlightRequestCount()} 方法引用，指标对象
+     * 没有修改计数的能力。每次采样都会沿 RpcProvider → NettyRpcServer 读取同一个
+     * InFlightRequestTracker，因此不会出现监控值与关闭排空值不一致的问题。</p>
+     */
+    @Bean
+    @ConditionalOnProperty(
+            prefix = "mini-rpc",
+            name = "provider-enabled",
+            havingValue = "true"
+    )
+    @ConditionalOnMissingBean(ProviderInFlightMetrics.class)
+    public ProviderInFlightMetrics providerInFlightMetrics(
+            MeterRegistry meterRegistry,
+            RpcProvider rpcProvider
+    ) {
+        return new ProviderInFlightMetrics(
+                meterRegistry,
+                rpcProvider::getInFlightRequestCount
+        );
+    }
+
+    /**
+     * 把 Provider 业务线程池已有的运行快照注册为 Micrometer 指标。
+     *
+     * <p>活跃线程和排队任务使用 Gauge；累计拒绝次数使用 FunctionCounter。
+     * 指标对象只持有 {@link RpcProvider} 的只读方法引用，不获得线程池控制权。</p>
+     */
+    @Bean
+    @ConditionalOnProperty(
+            prefix = "mini-rpc",
+            name = "provider-enabled",
+            havingValue = "true"
+    )
+    @ConditionalOnMissingBean(ProviderBusinessExecutorMetrics.class)
+    public ProviderBusinessExecutorMetrics providerBusinessExecutorMetrics(
+            MeterRegistry meterRegistry,
+            RpcProvider rpcProvider
+    ) {
+        return new ProviderBusinessExecutorMetrics(
+                meterRegistry,
+                rpcProvider::getActiveBusinessThreadCount,
+                rpcProvider::getQueuedBusinessTaskCount,
+                rpcProvider::getRejectedBusinessTaskCount
+        );
     }
 
     /**
